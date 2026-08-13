@@ -1,5 +1,6 @@
 //! Durable schemas and file helpers for LLM-judge calibration.
 
+use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,8 @@ pub const JUDGE_LABEL_SCHEMA: &str = "zeroclaw-eval/judge-label/v1";
 pub const CALIBRATION_SCHEMA: &str = "zeroclaw-eval/calibration/v1";
 /// Minimum number of human labels required before judge gating can be enabled.
 pub const MIN_CALIBRATION_RECORDS: usize = 50;
+/// Minimum judge/human agreement required before judge grades may gate.
+pub const AGREEMENT_FLOOR: f64 = 0.8;
 
 /// One parseable, non-unknown LLM-judge result ready for blind labeling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -453,6 +456,114 @@ pub fn load_calibration(
     Ok(calibration)
 }
 
+/// Load the canonical calibration artifact under the stricter gate contract.
+///
+/// The dump/label/finalize workflow and the runtime gate share
+/// [`CalibrationFile`] as their sole schema. This wrapper adds the gate-only
+/// path diagnostics and agreement floor without introducing a second artifact
+/// type.
+pub fn load_gating_calibration(
+    path: &Path,
+    effective_judge_ref: &str,
+) -> anyhow::Result<CalibrationFile> {
+    let display = path.display();
+    if path.is_dir() {
+        anyhow::bail!("calibration path {display} is a directory, not a calibration file");
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("calibration file {display} could not be read"))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        anyhow::bail!("calibration file {display} is empty");
+    }
+    let calibration: CalibrationFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("calibration file {display} is not a valid v1 record"))?;
+
+    anyhow::ensure!(
+        calibration.schema == CALIBRATION_SCHEMA,
+        "calibration {display} declares schema {:?}, expected {CALIBRATION_SCHEMA:?}",
+        calibration.schema
+    );
+    anyhow::ensure!(
+        calibration.judge_ref == effective_judge_ref,
+        "calibration {display} was issued for judge {:?} but the served judge is \
+         {effective_judge_ref:?}",
+        calibration.judge_ref
+    );
+    anyhow::ensure!(
+        calibration.labeled_records >= MIN_CALIBRATION_RECORDS,
+        "calibration {display} covers {} labeled record(s); at least \
+         {MIN_CALIBRATION_RECORDS} are required",
+        calibration.labeled_records
+    );
+    anyhow::ensure!(
+        calibration.agreement.is_finite() && (0.0..=1.0).contains(&calibration.agreement),
+        "calibration {display} reports agreement {} which is not a finite value in 0.0..=1.0",
+        calibration.agreement
+    );
+    anyhow::ensure!(
+        calibration.agreement >= AGREEMENT_FLOOR,
+        "calibration {display} reports agreement {:.2}, below the {AGREEMENT_FLOOR:.2} floor",
+        calibration.agreement
+    );
+    Ok(calibration)
+}
+
+/// Whether judge grades may affect the process exit code, and why not when they
+/// may not.
+#[derive(Debug)]
+pub enum GateDecision {
+    /// `[eval].judge_gate` is not set: judge grades are diagnostic by design.
+    Off,
+    /// Calibration validated against the served judge identity.
+    Gated(Box<CalibrationFile>),
+    /// The requested gate could not be honored; the reason is operator-readable.
+    Refused(String),
+}
+
+impl GateDecision {
+    /// Whether judge grades affect the exit code.
+    #[must_use]
+    pub fn gates(&self) -> bool {
+        matches!(self, Self::Gated(_))
+    }
+
+    /// The reason a requested gate was refused, if any.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Refused(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Decide whether judge grades may gate for one exact, non-fallback identity.
+#[must_use]
+pub fn decide_gate(
+    gate_requested: bool,
+    calibration_path: &Path,
+    judge_ref: &str,
+    provider_fallbacks: &[String],
+    model_fallbacks: &[String],
+) -> GateDecision {
+    if !gate_requested {
+        return GateDecision::Off;
+    }
+    if !provider_fallbacks.is_empty() || !model_fallbacks.is_empty() {
+        return GateDecision::Refused(format!(
+            "the judge provider for {judge_ref} has {} provider fallback(s) and {} model \
+             fallback(s) configured, so a call can be served by an identity the calibration was \
+             not issued for; remove them to gate on the judge",
+            provider_fallbacks.len(),
+            model_fallbacks.len()
+        ));
+    }
+    match load_gating_calibration(calibration_path, judge_ref) {
+        Ok(calibration) => GateDecision::Gated(Box::new(calibration)),
+        Err(error) => GateDecision::Refused(format!("{error:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +857,65 @@ mod tests {
         assert_eq!(
             rejection.to_string(),
             "labeled_records is 49, but at least 50 are required"
+        );
+    }
+
+    #[test]
+    fn gating_loader_rejects_low_agreement() {
+        let file = write_calibration(
+            &serde_json::json!({
+                "schema": CALIBRATION_SCHEMA,
+                "judge_ref": "provider:model",
+                "labeled_records": MIN_CALIBRATION_RECORDS,
+                "agreement": AGREEMENT_FLOOR - 0.01,
+                "labeler": "tester",
+                "date": "2026-07-21",
+            })
+            .to_string(),
+        );
+        let error = load_gating_calibration(file.path(), "provider:model").unwrap_err();
+        assert!(error.to_string().contains("below the 0.80 floor"));
+    }
+
+    #[test]
+    fn gating_loader_rejects_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = load_gating_calibration(directory.path(), "provider:model").unwrap_err();
+        assert!(error.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn gate_refuses_provider_or_model_fallbacks() {
+        let file = write_calibration(&calibration_json(
+            CALIBRATION_SCHEMA,
+            "provider:model",
+            MIN_CALIBRATION_RECORDS,
+        ));
+        let provider_fallback = decide_gate(
+            true,
+            file.path(),
+            "provider:model",
+            &["other.alias".to_string()],
+            &[],
+        );
+        let model_fallback = decide_gate(
+            true,
+            file.path(),
+            "provider:model",
+            &[],
+            &["other-model".to_string()],
+        );
+        assert!(!provider_fallback.gates());
+        assert!(!model_fallback.gates());
+        assert!(
+            provider_fallback
+                .refusal()
+                .is_some_and(|reason| reason.contains("fallback"))
+        );
+        assert!(
+            model_fallback
+                .refusal()
+                .is_some_and(|reason| reason.contains("fallback"))
         );
     }
 }

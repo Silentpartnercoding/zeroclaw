@@ -1171,6 +1171,7 @@ cli-eval-calibrate-finalize-min-agreement-refused = Refusing to emit: agreement 
 cli-eval-calibrate-finalize-wrote = Wrote calibration for {$judge_ref} to {$path} with {$count} labeled records.
 cli-eval-calibrate-finalize-hint = Commit this calibration file, then set [eval].judge_gate = true to make judge grades gating.
 
+cli-eval-judge-gate-diagnostic =   warning: [eval].judge_gate is set but judge grades stay diagnostic: {$reason}
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}

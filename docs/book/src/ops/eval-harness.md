@@ -122,18 +122,25 @@ gate unless `[eval].judge_gate` is true and the model-specific calibration file
 at `evals/calibration/<judge_ref>.json` is accepted. Here, `judge_ref` is the
 model-inclusive `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced by `_`,
 matching the comparability key. The consumer parses the file and requires the
-`zeroclaw-eval/calibration/v1` schema, an exact `judge_ref` match, and at least 50
-labeled records. A missing or rejected file produces a concrete warning and
-keeps judge grades diagnostic; merely placing a file at the expected path no
-longer enables gating.
+`zeroclaw-eval/calibration/v1` schema with no extra fields, an exact `judge_ref`
+match, at least 50 labeled records, and finite agreement in `0.0..=1.0` at or
+above `0.80`. The gate is also refused when the judge alias has provider or model
+fallbacks, because a calibration authorizes exactly one served identity. A
+missing or rejected file produces a concrete warning and keeps judge grades
+diagnostic; merely placing a file at the expected path no longer enables gating.
+
+A judge reply must be exactly
+`{"score": <0.0-1.0>, "unknown": <bool>, "reason": "<text>"}`. Missing,
+mistyped, extra, non-finite, or out-of-range fields make the reply
+`UNKNOWN (diagnostic)`; scores are never clamped into the accepted range.
 
 Judge token usage is never added to the case's own token totals (the judge runs
 outside the agent), and the judge reference joins the baseline comparability
 key, so swapping judges makes cases unverifiable rather than silently compared.
 
 Authoring rules: one dimension per rubric entry, and every judge case must also
-declare at least one deterministic check (workspace, tool, or budget) so it is not
-judge-only.
+declare at least one deterministic check (response, workspace, tool, or budget)
+so it is not judge-only. Both rules are enforced when the suite loads.
 
 ### Calibration workflow
 

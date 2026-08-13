@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
-use zeroclaw_eval::calibration::{
-    CalibrationRejection, JudgeRunRecord, append_judge_records, calibration_stem, load_calibration,
-};
+use zeroclaw_eval::calibration::{JudgeRunRecord, append_judge_records, calibration_stem};
 use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
@@ -241,7 +239,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, _provider_type, _resolved_model) =
                         build_session_model_provider(&cfg, &provider_ref, None)?;
-                    Ok(provider)
+                    Ok(zeroclaw_eval::runner::BuiltProvider::plain(provider))
                 }),
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),
@@ -254,36 +252,43 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
     Ok(deps)
 }
 
-#[derive(Debug)]
-enum JudgeGateResolution {
-    Disabled,
-    Accepted,
-    Missing,
-    Rejected(CalibrationRejection),
-}
-
-fn resolve_judge_gate(
-    enabled: bool,
-    calibration_path: &Path,
-    judge_ref: &str,
-) -> JudgeGateResolution {
-    if !enabled {
-        return JudgeGateResolution::Disabled;
-    }
-    match load_calibration(calibration_path, judge_ref) {
-        Ok(_) => JudgeGateResolution::Accepted,
-        Err(CalibrationRejection::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            JudgeGateResolution::Missing
-        }
-        Err(rejection) => JudgeGateResolution::Rejected(rejection),
-    }
+/// The provider- and model-level fallbacks configured for a judge alias.
+///
+/// A calibration authorizes exactly one `<type>.<alias>:<model>` identity. When
+/// the judge alias can fail over, a successful call may be served by a different
+/// provider or model than the one calibrated, so the gate must refuse rather
+/// than trust the configured primary ref. Returns `(provider_fallbacks,
+/// model_fallbacks)`.
+fn judge_fallbacks(config: &Config, judge_provider: &str) -> (Vec<String>, Vec<String>) {
+    let Some((family, alias)) = judge_provider.split_once('.') else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(entry) = config.providers.models.find(family, alias) else {
+        return (Vec::new(), Vec::new());
+    };
+    let providers = entry
+        .fallback
+        .iter()
+        .map(|r| r.as_str().to_string())
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    let models = entry
+        .fallback_models
+        .iter()
+        .filter(|m| !m.trim().is_empty())
+        .cloned()
+        .collect();
+    (providers, models)
 }
 
 /// Build judge deps from config, or `None` when `[eval].judge_provider` is empty.
-/// Judge grades gate only when `judge_gate` is set AND the model-specific
-/// calibration file passes schema, judge-ref, and labeled-record validation.
+///
+/// Judge grades gate only when `judge_gate` is set AND a calibration artifact at
+/// `evals/calibration/<judge_ref>.json` LOADS AND VALIDATES for the judge
+/// identity actually served (schema, exact `judge_ref`, minimum labeled records,
+/// agreement floor) AND that identity cannot change under fallback. Any other
+/// outcome keeps grades diagnostic and prints the specific reason — the gate
+/// never degrades silently.
 fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
     let judge_provider = config.eval.judge_provider.as_str().trim().to_string();
     if judge_provider.is_empty() {
@@ -296,39 +301,28 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
         "evals/calibration/{}.json",
         calibration_stem(&judge_ref)
     ));
-    let gates = match resolve_judge_gate(config.eval.judge_gate, &calibration_path, &judge_ref) {
-        JudgeGateResolution::Disabled => false,
-        JudgeGateResolution::Missing => {
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-eval-calibrate-gate-missing",
-                    &[("judge_ref", judge_ref.as_str())],
-                )
-            );
-            false
-        }
-        JudgeGateResolution::Accepted => true,
-        JudgeGateResolution::Rejected(rejection) => {
-            let reason = super::eval_calibrate::localized_calibration_rejection(&rejection);
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-eval-calibrate-gate-rejected",
-                    &[
-                        ("judge_ref", judge_ref.as_str()),
-                        ("reason", reason.as_str()),
-                    ],
-                )
-            );
-            false
-        }
-    };
+    let (provider_fallbacks, model_fallbacks) = judge_fallbacks(config, &judge_provider);
+    let decision = zeroclaw_eval::calibration::decide_gate(
+        config.eval.judge_gate,
+        &calibration_path,
+        &judge_ref,
+        &provider_fallbacks,
+        &model_fallbacks,
+    );
+    if let Some(reason) = decision.refusal() {
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-judge-gate-diagnostic",
+                &[("reason", reason)],
+            )
+        );
+    }
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
-        gates,
+        gates: decision.gates(),
         records_sink: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     }))
 }
@@ -569,20 +563,14 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("calibration.json");
-        assert!(matches!(
-            resolve_judge_gate(false, &path, "provider:model"),
-            JudgeGateResolution::Disabled
-        ));
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Missing
-        ));
+        let decide = |enabled| {
+            zeroclaw_eval::calibration::decide_gate(enabled, &path, "provider:model", &[], &[])
+        };
+        assert!(!decide(false).gates());
+        assert!(decide(true).refusal().is_some());
 
         std::fs::write(&path, "not json").unwrap();
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Rejected(CalibrationRejection::Malformed { .. })
-        ));
+        assert!(decide(true).refusal().is_some());
 
         std::fs::write(
             &path,
@@ -593,10 +581,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Rejected(CalibrationRejection::WrongSchema { .. })
-        ));
+        assert!(decide(true).refusal().is_some());
 
         std::fs::write(
             &path,
@@ -607,10 +592,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Rejected(CalibrationRejection::WrongJudgeRef { .. })
-        ));
+        assert!(decide(true).refusal().is_some());
 
         std::fs::write(
             &path,
@@ -621,10 +603,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Rejected(CalibrationRejection::InsufficientRecords { .. })
-        ));
+        assert!(decide(true).refusal().is_some());
 
         std::fs::write(
             &path,
@@ -635,10 +614,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(
-            resolve_judge_gate(true, &path, "provider:model"),
-            JudgeGateResolution::Accepted
-        ));
+        assert!(decide(true).gates());
     }
 
     #[test]
