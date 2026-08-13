@@ -13817,11 +13817,21 @@ type = "manual"
             .last_finished_run("cp-deny")
             .expect("denied run reached the finished list");
         assert_eq!(run.status, SopRunStatus::Failed);
+        let failure_reason = run
+            .failure_reason
+            .as_deref()
+            .expect("a denied checkpoint must retain its terminal reason");
+        assert!(failure_reason.contains("not appropriate"));
         let events = engine.run_events(&run_id).unwrap_or_default();
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint deny must append a gate_resolved ledger row: {events:?}"
         );
+        let failure_event = events
+            .iter()
+            .find(|event| event.kind == "run_failed")
+            .expect("checkpoint denial must append a terminal failure row");
+        assert_eq!(failure_event.reason.as_deref(), Some(failure_reason));
     }
 
     /// `capability(noop) -> checkpoint(edit: body) -> capability(noop)`: the

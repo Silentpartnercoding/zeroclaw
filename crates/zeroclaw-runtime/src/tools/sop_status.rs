@@ -111,7 +111,11 @@ impl Tool for SopStatusTool {
                         let _ = writeln!(output, "Completed: {completed}");
                     }
                     if let Some(ref failure_reason) = run.failure_reason {
-                        let _ = writeln!(output, "Failure reason: {failure_reason}");
+                        let failure_line = crate::i18n::get_required_cli_string_with_args(
+                            "cli-sop-status-failure-reason",
+                            &[("reason", failure_reason)],
+                        );
+                        let _ = writeln!(output, "{failure_line}");
                     }
                     if !run.step_results.is_empty() {
                         let _ = writeln!(output, "\nStep results:");
@@ -331,6 +335,35 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains(&format!("Run: {run_id}")));
         assert!(result.output.contains("Status: running"));
+    }
+
+    #[tokio::test]
+    async fn failed_status_localizes_the_retained_reason() {
+        let engine = engine_with_sops(vec![test_sop("s1")]);
+        let run_id = {
+            let mut engine = engine.lock().unwrap();
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let run_id = match action {
+                crate::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+                other => panic!("expected an executable first step, got {other:?}"),
+            };
+            engine
+                .finish_run(
+                    &run_id,
+                    crate::sop::SopRunStatus::Failed,
+                    Some("disk quota exceeded".to_string()),
+                )
+                .unwrap();
+            run_id
+        };
+        let tool = SopStatusTool::new(engine);
+        let result = tool.execute(json!({"run_id": run_id})).await.unwrap();
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "cli-sop-status-failure-reason",
+            &[("reason", "disk quota exceeded")],
+        );
+        assert!(result.success);
+        assert!(result.output.lines().any(|line| line == expected));
     }
 
     #[tokio::test]
