@@ -177,8 +177,8 @@ where
         }
         MemoryBackendKind::Qdrant => {
             anyhow::bail!(
-                "memory backend 'qdrant' requires a `[storage.qdrant.<alias>]` storage config; \
-                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+                "memory backend 'qdrant' is not supported by this operation; choose sqlite, lucid, \
+                 or markdown"
             )
         }
         MemoryBackendKind::Markdown => wrap_scanned_and_audit(
@@ -2027,8 +2027,8 @@ store_timeout_ms = 40000
 
     /// Regression for the builder-only factory: `qdrant` must never silently
     /// degrade to the Markdown fallback. On the pre-fix code this returned a
-    /// working handle named "markdown"; now it is an explicit error pointing
-    /// at the storage-aware factory.
+    /// working handle named "markdown"; now it is an explicit error naming
+    /// supported targets without exposing an internal factory function.
     #[test]
     fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
         let tmp = TempDir::new().unwrap();
@@ -2040,10 +2040,13 @@ store_timeout_ms = 40000
             .expect("backend=qdrant must be rejected by the builder-only factory");
         let message = error.to_string();
         assert!(
-            message.contains("storage.qdrant")
-                && message.contains("create_memory_with_storage_and_routes"),
-            "error should direct callers to the storage-aware factory: {message}"
+            message.contains("not supported")
+                && message.contains("sqlite")
+                && message.contains("lucid")
+                && message.contains("markdown"),
+            "error should direct operators to supported targets: {message}"
         );
+        assert!(!message.contains("create_memory_"));
     }
 
     /// The storage-aware factory still accepts Qdrant when a
