@@ -4096,8 +4096,10 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(execute_job_with_retry(&config, &security, TEST_AGENT, &job)).await;
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ))
+        .await;
 
         assert!(!success);
         assert!(
