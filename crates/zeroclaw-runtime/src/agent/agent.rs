@@ -6419,6 +6419,9 @@ mod tests {
                         output: "b".into(),
                     },
                 ),
+                Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk::delta("done"),
+                )),
                 Ok(zeroclaw_providers::traits::StreamEvent::Final),
             ])
             .boxed()
