@@ -7994,9 +7994,9 @@ mod tests {
     ///
     /// This closes that specific hole at the source level: every arm of the
     /// ack `match` must go through `i18n::get_required_cli_string`, and no
-    /// arm may carry a bare English literal. Together the two tests give the
-    /// blocker the coverage Audacity88 asked for — a future move of this
-    /// block cannot silently re-hard-code the strings.
+    /// arm may carry a bare English literal. Together the two tests pin the
+    /// catalogue contract at both the behavioural and source level, so a
+    /// future move of this block cannot silently re-hard-code the strings.
     #[test]
     fn callback_ack_arms_are_all_catalogue_lookups() {
         let region = callback_ack_source_region();
