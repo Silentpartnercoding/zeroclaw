@@ -10501,7 +10501,7 @@ mod tests {
             },
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let listener = tokio::spawn(async move {
+        let listener = ::zeroclaw_spawn::spawn!(async move {
             use zeroclaw_api::channel::Channel;
             let _ = channel.listen(tx).await;
         });
