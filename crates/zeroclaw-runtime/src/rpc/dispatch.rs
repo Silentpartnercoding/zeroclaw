@@ -22,8 +22,7 @@ use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
     JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest,
-    SopRunRequest,
-    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -4319,7 +4318,7 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let run = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -4328,7 +4327,8 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
-        to_result(serde_json::json!({ "run": run }))
+        let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
+        to_result(serde_json::json!({ "run": detail }))
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
@@ -4930,6 +4930,183 @@ fn notification_for_turn_event(
 
 #[cfg(test)]
 mod tests {
+    /// `sops/run-detail` must serialize the explicit projection, never the
+    /// persisted run: seeded credentials in the step output, tool arguments,
+    /// tool output, and trigger topic are scrubbed at the response boundary;
+    /// the raw trigger payload, framing marker, revision bookkeeping, and
+    /// structured tool output are excluded outright; and exactly the
+    /// documented fields cross the wire.
+    #[tokio::test]
+    async fn sops_run_detail_serializes_a_scrubbed_projection_of_a_terminal_run() {
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTriggerSource, StepToolCall,
+        };
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "detail-scrub".into(),
+            description: "wire projection regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "detail-scrub",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: Some("deploy token=TOPICSECRET66666".into()),
+                    payload: Some("PAYLOADSECRET55555".into()),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                },
+            )
+            .expect("run starts");
+        let SopRunAction::ExecuteStep { run_id, .. } = action else {
+            panic!("an auto SOP with one step starts at ExecuteStep, got {action:?}");
+        };
+        engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "posted with api_key=STEPSECRET99999".into(),
+                    started_at: "2026-01-01T00:00:01Z".into(),
+                    completed_at: Some("2026-01-01T00:00:02Z".into()),
+                    effective_agent: Some("reviewer".into()),
+                    tool_calls: vec![StepToolCall {
+                        index: 0,
+                        tool: "shell".into(),
+                        args: serde_json::json!({"token": "ARGSECRET888888"}),
+                        success: true,
+                        output: "done password=TOOLSECRET77777".into(),
+                        output_data: Some(serde_json::json!({"x": "DATASECRET44444"})),
+                        error: None,
+                        duration_ms: 5,
+                    }],
+                },
+            )
+            .expect("the single step completes the run in-process");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("a retained terminal run resolves over RPC");
+
+        let run = value
+            .get("run")
+            .and_then(|v| v.as_object())
+            .expect("run object");
+        let keys: BTreeSet<&str> = run.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = [
+            "run_id",
+            "sop_name",
+            "status",
+            "current_step",
+            "total_steps",
+            "started_at",
+            "completed_at",
+            "waiting_since",
+            "trigger_source",
+            "trigger_topic",
+            "active",
+            "steps",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected, "only the documented projection crosses");
+        assert_eq!(run["active"], serde_json::Value::Bool(false));
+
+        let step = run["steps"][0].as_object().expect("step object");
+        let step_keys: BTreeSet<&str> = step.keys().map(String::as_str).collect();
+        let expected_step: BTreeSet<&str> = [
+            "step_number",
+            "status",
+            "output",
+            "started_at",
+            "completed_at",
+            "effective_agent",
+            "tool_calls",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(step_keys, expected_step);
+
+        let call = run["steps"][0]["tool_calls"][0]
+            .as_object()
+            .expect("tool call object");
+        let call_keys: BTreeSet<&str> = call.keys().map(String::as_str).collect();
+        let expected_call: BTreeSet<&str> =
+            ["index", "tool", "args", "success", "output", "duration_ms"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            call_keys, expected_call,
+            "a None error is omitted and structured tool output never crosses"
+        );
+
+        let wire = serde_json::to_string(&value).expect("serializable");
+        for secret in [
+            "PAYLOADSECRET55555",
+            "STEPSECRET99999",
+            "ARGSECRET888888",
+            "TOOLSECRET77777",
+            "DATASECRET44444",
+            "TOPICSECRET66666",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} must not cross the RPC boundary"
+            );
+        }
+        for excluded in [
+            "frame_marker_id",
+            "revision",
+            "llm_calls_saved",
+            "payload",
+            "output_data",
+        ] {
+            assert!(
+                !wire.contains(excluded),
+                "{excluded} must not be on the wire"
+            );
+        }
+    }
+
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;

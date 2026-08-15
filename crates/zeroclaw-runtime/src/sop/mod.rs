@@ -336,23 +336,21 @@ pub fn run_overlay_for(
 /// newest first, optionally scoped to one SOP. Errors only if the engine
 /// lock is poisoned. This is the Runs surface's data source.
 /// Full detail for one run — the step results, tool calls, timings, and
-/// failure output that [`SopRunSummary`] deliberately omits. Searches active
-/// runs first, then the retained terminal window.
+/// failure output that [`SopRunSummary`] deliberately omits, plus whether the
+/// run is still live. `SopEngine::get_run` is the single lookup owner: it
+/// already searches active runs and the retained terminal window.
 pub fn run_detail_for(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
-) -> Result<crate::sop::types::SopRun> {
+) -> Result<(crate::sop::types::SopRun, bool)> {
     let guard = engine
         .lock()
         .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
-    if let Some(run) = guard.get_run(run_id) {
-        return Ok(run.clone());
-    }
+    let active = guard.active_runs().contains_key(run_id);
     guard
-        .finished_runs(None)
-        .into_iter()
-        .find(|r| r.run_id == run_id)
+        .get_run(run_id)
         .cloned()
+        .map(|run| (run, active))
         .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))
 }
 
@@ -1164,11 +1162,10 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
 #[cfg(test)]
 mod tests {
     /// `sops/runs` returns summaries by design; the detail lookup is what a UI
-    /// drills into for a selected run. Covers the active-run branch (the run a
-    /// UI is watching live) and the unknown-id refusal. The terminal-window
-    /// branch is a linear scan of `finished_runs`, exercised in production but
-    /// not separately constructed here: reaching a terminal run requires a
-    /// driven step, which needs a provider this unit test does not stand up.
+    /// drills into for a selected run. Covers the live branch, the retained
+    /// terminal branch (`advance_step` completes the single step in-process,
+    /// no provider involved — `SopEngine::get_run` owns both lookups), and
+    /// the unknown-id refusal.
     #[test]
     fn run_detail_finds_an_active_run_and_rejects_unknown_ids() {
         use crate::sop::types::{
@@ -1217,10 +1214,33 @@ mod tests {
         };
         let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
 
-        let run = run_detail_for(&engine, &run_id).expect("active run is found");
+        let (run, active) = run_detail_for(&engine, &run_id).expect("active run is found");
         assert_eq!(run.run_id, run_id);
         assert_eq!(run.sop_name, "detail-test");
         assert_eq!(run.current_step, 1);
+        assert!(active, "a running run is reported live");
+
+        engine
+            .lock()
+            .unwrap()
+            .advance_step(
+                &run_id,
+                crate::sop::types::SopStepResult {
+                    step_number: 1,
+                    status: crate::sop::types::SopStepStatus::Completed,
+                    output: "ok".into(),
+                    started_at: "2026-01-01T00:00:01Z".into(),
+                    completed_at: Some("2026-01-01T00:00:02Z".into()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .expect("the single step completes the run in-process");
+
+        let (run, active) = run_detail_for(&engine, &run_id)
+            .expect("the retained terminal run resolves through the same lookup");
+        assert_eq!(run.status, crate::sop::types::SopRunStatus::Completed);
+        assert!(!active, "a retained terminal run is not live");
 
         let err =
             run_detail_for(&engine, "run-does-not-exist").expect_err("unknown id must not resolve");
