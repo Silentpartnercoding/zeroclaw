@@ -1,7 +1,7 @@
 //! Agent rename/delete **owned-state** cascades: the non-config half of
 //! changing an agent alias lifecycle.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -19,11 +19,80 @@ pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<us
         .context("count live ACP sessions for agent")
 }
 
+/// Durable archive location and any workspace-archive failures that must be
+/// surfaced alongside the owned-store cascade.
+#[derive(Debug)]
+pub struct AgentDeletionArchive {
+    pub path: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+/// Create the canonical agent-deletion archive and move its workspace into it.
+pub async fn archive_agent_workspace(
+    config: &Config,
+    alias: &str,
+    workspace: &Path,
+) -> AgentDeletionArchive {
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let archive_dir = config
+        .data_dir
+        .join("agents")
+        .join("_deleted")
+        .join(format!("{alias}-{ts}"));
+    let mut warnings = Vec::new();
+    if let Err(error) = tokio::fs::create_dir_all(&archive_dir).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "agent": alias,
+                    "archive": archive_dir.display().to_string(),
+                    "error": error.to_string(),
+                })),
+            "agent delete: archive directory creation failed"
+        );
+        warnings.push(format!(
+            "archive directory creation failed ({}): {error}",
+            archive_dir.display()
+        ));
+    }
+    if workspace.exists() {
+        let destination = archive_dir.join("workspace");
+        if let Err(error) = tokio::fs::rename(workspace, &destination).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "agent": alias,
+                        "from": workspace.display().to_string(),
+                        "to": destination.display().to_string(),
+                        "error": error.to_string(),
+                    })),
+                "agent delete: workspace archive failed"
+            );
+            warnings.push(format!(
+                "workspace archive failed ({} -> {}): {error}",
+                workspace.display(),
+                destination.display()
+            ));
+        }
+    }
+
+    AgentDeletionArchive {
+        path: archive_dir,
+        warnings,
+    }
+}
+
 /// What the owned-state cascade removed.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OwnedStateReport {
     pub memory_purged: usize,
     pub knowledge_purged: usize,
+    #[serde(default)]
+    pub knowledge_foreign_edges_purged: usize,
     pub cron_removed: usize,
     pub acp_removed: usize,
     pub sessions_cleared: usize,
@@ -73,7 +142,7 @@ fn archive_warning(kind: &str, err: &anyhow::Error) -> String {
 
 fn knowledge_purge_skipped_warning(err: &anyhow::Error) -> String {
     let error = err.to_string();
-    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+    crate::i18n::get_required_cli_string_with_args(
         "cli-alias-knowledge-purge-skipped",
         &[("error", error.as_str())],
     )
@@ -81,7 +150,7 @@ fn knowledge_purge_skipped_warning(err: &anyhow::Error) -> String {
 
 pub async fn cascade_owned_state(
     config: &Config,
-    mem: &Arc<dyn Memory>,
+    mem: Option<&Arc<dyn Memory>>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
     archive_dir: &Path,
@@ -101,27 +170,31 @@ pub async fn cascade_owned_state(
     // ── memory: export → archive → purge. Failures are SURFACED in `warnings`,
     // not masked as 0 (markdown/none have no DB rows — their memory lives in the
     // archived workspace — but a real backend error must stay visible). ────────
-    let mem_rows = match mem.export_agent(alias).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warnings.push(format!("memory export: {e}"));
-            Vec::new()
+    let memory_purged = if let Some(mem) = mem {
+        let mem_rows = match mem.export_agent(alias).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warnings.push(format!("memory export: {e}"));
+                Vec::new()
+            }
+        };
+        match serde_json::to_vec_pretty(&mem_rows).context("serialize memory export") {
+            Ok(bytes) => {
+                if let Err(err) = write_json(&cascade_dir.join("memory.json"), bytes).await {
+                    warnings.push(archive_warning("memory", &err));
+                }
+            }
+            Err(err) => warnings.push(archive_warning("memory", &err)),
         }
-    };
-    match serde_json::to_vec_pretty(&mem_rows).context("serialize memory export") {
-        Ok(bytes) => {
-            if let Err(err) = write_json(&cascade_dir.join("memory.json"), bytes).await {
-                warnings.push(archive_warning("memory", &err));
+        match mem.purge_agent(alias).await {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("memory purge: {e}"));
+                0
             }
         }
-        Err(err) => warnings.push(archive_warning("memory", &err)),
-    }
-    let memory_purged = match mem.purge_agent(alias).await {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("memory purge: {e}"));
-            0
-        }
+    } else {
+        0
     };
 
     // ── knowledge graph: export → archive → purge. The graph owns durable
@@ -129,7 +202,7 @@ pub async fn cascade_owned_state(
     // cascade as memory/session state. Avoid creating an empty DB when the
     // operator has never enabled knowledge.
     let knowledge_path = config.knowledge.resolved_db_path();
-    let knowledge_purged = if knowledge_path.exists() {
+    let knowledge_purge = if knowledge_path.exists() {
         match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
@@ -141,34 +214,34 @@ pub async fn cascade_owned_state(
                     serde_json::to_vec_pretty(&rows).context("serialize owned knowledge export")
                 }) {
                 Ok(bytes) => match write_json(&cascade_dir.join("knowledge.json"), bytes).await {
-                    Ok(()) => match graph.purge_owner(alias) {
-                        Ok(n) => n,
+                    Ok(()) => match graph.purge_owner_with_report(alias) {
+                        Ok(report) => report,
                         Err(e) => {
                             warnings.push(format!("knowledge purge: {e}"));
-                            0
+                            Default::default()
                         }
                     },
                     Err(err) => {
                         warnings.push(knowledge_purge_skipped_warning(&err));
-                        0
+                        Default::default()
                     }
                 },
                 Err(err) => {
                     warnings.push(knowledge_purge_skipped_warning(&err));
-                    0
+                    Default::default()
                 }
             },
             Err(e) => {
                 warnings.push(format!("knowledge graph open: {e}"));
-                0
+                Default::default()
             }
         }
     } else {
-        0
+        Default::default()
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
-    let cron_jobs = match zeroclaw_runtime::cron::list_jobs_by_agent(config, alias) {
+    let cron_jobs = match crate::cron::list_jobs_by_agent(config, alias) {
         Ok(jobs) => jobs,
         Err(e) => {
             warnings.push(format!("cron list: {e}"));
@@ -183,7 +256,7 @@ pub async fn cascade_owned_state(
         }
         Err(err) => warnings.push(archive_warning("cron", &err)),
     }
-    let cron_removed = match zeroclaw_runtime::cron::remove_jobs_by_agent(config, alias) {
+    let cron_removed = match crate::cron::remove_jobs_by_agent(config, alias) {
         Ok(n) => n,
         Err(e) => {
             warnings.push(format!("cron remove: {e}"));
@@ -251,7 +324,8 @@ pub async fn cascade_owned_state(
 
     let mut report = OwnedStateReport {
         memory_purged,
-        knowledge_purged,
+        knowledge_purged: knowledge_purge.total(),
+        knowledge_foreign_edges_purged: knowledge_purge.affected_foreign_edges,
         cron_removed,
         acp_removed,
         sessions_cleared,
@@ -264,6 +338,7 @@ pub async fn cascade_owned_state(
         "alias": alias,
         "memory_rows": report.memory_purged,
         "knowledge_rows": report.knowledge_purged,
+        "knowledge_foreign_edges": report.knowledge_foreign_edges_purged,
         "cron_jobs": report.cron_removed,
         "acp_sessions": report.acp_removed,
         "sessions_cleared": report.sessions_cleared,
@@ -282,7 +357,7 @@ pub async fn cascade_owned_state(
 }
 
 /// What the agent-rename owned-state cascade re-pointed
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RenameStateReport {
     pub memory_rows: usize,
     pub knowledge_rows: usize,
@@ -296,19 +371,23 @@ pub struct RenameStateReport {
 
 pub async fn cascade_rename_agent(
     config: &Config,
-    mem: &Arc<dyn Memory>,
+    mem: Option<&Arc<dyn Memory>>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     from: &str,
     to: &str,
 ) -> RenameStateReport {
     let mut warnings: Vec<String> = Vec::new();
 
-    let memory_rows = match mem.rename_agent(from, to).await {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("memory rename: {e}"));
-            0
+    let memory_rows = if let Some(mem) = mem {
+        match mem.rename_agent(from, to).await {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("memory rename: {e}"));
+                0
+            }
         }
+    } else {
+        0
     };
 
     let knowledge_path = config.knowledge.resolved_db_path();
@@ -333,7 +412,7 @@ pub async fn cascade_rename_agent(
         0
     };
 
-    let cron_jobs = match zeroclaw_runtime::cron::rename_jobs_by_agent(config, from, to) {
+    let cron_jobs = match crate::cron::rename_jobs_by_agent(config, from, to) {
         Ok(n) => n,
         Err(e) => {
             warnings.push(format!("cron rename: {e}"));

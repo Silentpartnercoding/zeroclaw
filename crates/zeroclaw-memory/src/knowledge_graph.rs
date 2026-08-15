@@ -113,6 +113,25 @@ pub struct KnowledgeEdge {
     pub relation: Relation,
 }
 
+/// Counts returned by the canonical owner purge.
+///
+/// Relationships owned by another agent can still point at a node owned by
+/// the deleted agent. They must be removed with that endpoint, but are counted
+/// separately so the lifecycle archive and operator-facing report do not hide
+/// the cross-owner data loss behind SQLite's foreign-key cascade.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeOwnerPurgeReport {
+    pub owned_nodes: usize,
+    pub owned_edges: usize,
+    pub affected_foreign_edges: usize,
+}
+
+impl KnowledgeOwnerPurgeReport {
+    pub fn total(self) -> usize {
+        self.owned_nodes + self.owned_edges + self.affected_foreign_edges
+    }
+}
+
 /// A search result with relevance score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -463,20 +482,95 @@ impl KnowledgeGraph {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, relation))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
+        let mut foreign_edge_stmt = conn.prepare(
+            "SELECT edge.from_id, edge.to_id, edge.relation, edge.owner_agent
+             FROM edges AS edge
+             WHERE edge.owner_agent IS NOT ?1
+               AND (
+                   edge.from_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+                   OR edge.to_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+               )
+             ORDER BY edge.from_id, edge.to_id, edge.relation, edge.owner_agent",
+        )?;
+        let affected_foreign_edges = foreign_edge_stmt
+            .query_map(params![alias], |row| {
+                Ok(serde_json::json!({
+                    "from_id": row.get::<_, String>(0)?,
+                    "to_id": row.get::<_, String>(1)?,
+                    "relation": row.get::<_, String>(2)?,
+                    "owner_agent": row.get::<_, Option<String>>(3)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(serde_json::json!({
+            "nodes": nodes,
+            "edges": edges,
+            "affected_foreign_edges": affected_foreign_edges,
+        }))
     }
 
-    /// Remove graph rows owned by an agent during the canonical delete cascade.
-    pub fn purge_owner(&self, alias: &str) -> anyhow::Result<usize> {
+    /// Remove graph rows owned by an agent during the canonical delete cascade,
+    /// explicitly accounting for foreign-owned edges that lose an endpoint.
+    pub fn purge_owner_with_report(
+        &self,
+        alias: &str,
+    ) -> anyhow::Result<KnowledgeOwnerPurgeReport> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("failed to begin knowledge ownership purge")?;
-        let owned_edges = tx.execute("DELETE FROM edges WHERE owner_agent = ?1", params![alias])?;
-        let owned_nodes = tx.execute("DELETE FROM nodes WHERE owner_agent = ?1", params![alias])?;
+        let owned_nodes: usize = tx.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE owner_agent = ?1",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        let owned_edges: usize = tx.query_row(
+            "SELECT COUNT(*) FROM edges WHERE owner_agent = ?1",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        let affected_foreign_edges: usize = tx.query_row(
+            "SELECT COUNT(*)
+             FROM edges AS edge
+             WHERE edge.owner_agent IS NOT ?1
+               AND (
+                   edge.from_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+                   OR edge.to_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+               )",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        let deleted_edges = tx.execute(
+            "DELETE FROM edges
+             WHERE owner_agent = ?1
+                OR from_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)
+                OR to_id IN (SELECT id FROM nodes WHERE owner_agent = ?1)",
+            params![alias],
+        )?;
+        let deleted_nodes =
+            tx.execute("DELETE FROM nodes WHERE owner_agent = ?1", params![alias])?;
+        anyhow::ensure!(
+            deleted_edges == owned_edges + affected_foreign_edges,
+            "knowledge ownership purge edge count changed during transaction: expected {}, removed {deleted_edges}",
+            owned_edges + affected_foreign_edges,
+        );
+        anyhow::ensure!(
+            deleted_nodes == owned_nodes,
+            "knowledge ownership purge node count changed during transaction: expected {owned_nodes}, removed {deleted_nodes}",
+        );
         tx.commit()
             .context("failed to commit knowledge ownership purge")?;
-        Ok(owned_nodes + owned_edges)
+        Ok(KnowledgeOwnerPurgeReport {
+            owned_nodes,
+            owned_edges,
+            affected_foreign_edges,
+        })
+    }
+
+    /// Remove all graph rows affected by deleting an owner and return the total.
+    pub fn purge_owner(&self, alias: &str) -> anyhow::Result<usize> {
+        self.purge_owner_with_report(alias)
+            .map(KnowledgeOwnerPurgeReport::total)
     }
 
     /// Bring a pre-attribution database up to the owned schema. Runs in
@@ -2214,6 +2308,58 @@ mod tests {
         assert_eq!(export["edges"].as_array().unwrap().len(), 1);
         assert_eq!(graph.purge_owner("renamed").unwrap(), 3);
         assert_eq!(graph.count_owner("renamed").unwrap(), 0);
+    }
+
+    #[test]
+    fn owner_delete_archives_and_counts_affected_foreign_edges() {
+        let (_tmp, graph, _unused) = test_graph();
+        let alpha = agent("alpha");
+        let beta = agent_reading_from("beta", &["alpha"]);
+        let alpha_node = graph
+            .add_node(
+                &alpha,
+                NodeType::Pattern,
+                "Alpha",
+                "shared endpoint",
+                &[],
+                None,
+            )
+            .unwrap();
+        let beta_node = graph
+            .add_node(
+                &beta,
+                NodeType::Technology,
+                "Beta",
+                "surviving endpoint",
+                &[],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_edge(&beta, &beta_node, &alpha_node, Relation::Uses)
+            .unwrap();
+
+        let export = graph.export_owner("alpha").unwrap();
+        assert_eq!(export["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(export["edges"].as_array().unwrap().len(), 0);
+        let affected = export["affected_foreign_edges"].as_array().unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0]["owner_agent"], "beta");
+        assert_eq!(affected[0]["from_id"], beta_node);
+        assert_eq!(affected[0]["to_id"], alpha_node);
+
+        let report = graph.purge_owner_with_report("alpha").unwrap();
+        assert_eq!(report.owned_nodes, 1);
+        assert_eq!(report.owned_edges, 0);
+        assert_eq!(report.affected_foreign_edges, 1);
+        assert_eq!(report.total(), 2);
+        assert!(graph.get_node(&beta, &beta_node).unwrap().is_some());
+        assert!(
+            graph
+                .find_outbound(&beta, &beta_node, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

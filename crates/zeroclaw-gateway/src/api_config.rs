@@ -1123,7 +1123,9 @@ async fn delete_agent_cascade(
     // if the session store can't be read we refuse rather than risk orphaning
     // live sessions.
     let plan = alias_refs::plan_delete(&working, &AliasKind::Agent, alias);
-    let live_acp = match crate::agent_owned_state::live_acp_session_count(&working, alias) {
+    let live_acp = match zeroclaw_runtime::agent_owned_state::live_acp_session_count(
+        &working, alias,
+    ) {
         Ok(n) => n,
         Err(e) => {
             return error_response(
@@ -1191,42 +1193,16 @@ async fn delete_agent_cascade(
     // Read it back from the (now-swapped) AppState for the side-effects below.
     let committed = state.config.read().clone();
 
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = committed
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
-    let mut warnings: Vec<String> = Vec::new();
-    if let Err(err) = tokio::fs::create_dir_all(&archive_dir).await {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": alias, "archive": archive_dir.display().to_string(), "err": err.to_string()})), "agent delete: archive dir creation failed");
-        warnings.push(format!(
-            "archive dir creation failed ({}): {err}",
-            archive_dir.display()
-        ));
-    }
-    if workspace.exists() {
-        let dest = archive_dir.join("workspace");
-        if let Err(err) = tokio::fs::rename(&workspace, &dest).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent": alias, "from": workspace.display().to_string(), "to": dest.display().to_string(), "err": err.to_string()})),
-                "agent delete: workspace archive failed"
-            );
-            warnings.push(format!(
-                "workspace archive failed ({} -> {}): {err}",
-                workspace.display(),
-                dest.display()
-            ));
-        }
-    }
+    let archive =
+        zeroclaw_runtime::agent_owned_state::archive_agent_workspace(&committed, alias, &workspace)
+            .await;
+    let archive_dir = archive.path;
+    let mut warnings = archive.warnings;
 
     // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
-    let owned = crate::agent_owned_state::cascade_owned_state(
+    let owned = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
         &committed,
-        &state.mem,
+        Some(&state.mem),
         state.session_backend.as_ref(),
         alias,
         &archive_dir,
@@ -1237,7 +1213,7 @@ async fn delete_agent_cascade(
     // sees the FULL partial-failure picture in the response, not just the
     // server log.
     warnings.extend(owned.warnings.iter().cloned());
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "knowledge": owned.knowledge_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string(), "warnings": warnings.len()})), "agent deleted with owned-state cascade");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "knowledge": owned.knowledge_purged, "knowledge_foreign_edges": owned.knowledge_foreign_edges_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string(), "warnings": warnings.len()})), "agent deleted with owned-state cascade");
 
     axum::Json(MapKeyResponse {
         path: "agents".to_string(),
@@ -1446,7 +1422,7 @@ pub async fn handle_delete_plan(
     // For agents the live-ACP gate also blocks; it fails closed (an error
     // counting sessions ⇒ "not allowed"), matching the real delete.
     let live_acp = if is_agent {
-        crate::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
+        zeroclaw_runtime::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
     } else {
         None
     };
@@ -1793,9 +1769,9 @@ async fn rename_agent_cascade(
     warnings.extend(move_warning);
 
     // Re-point owned DB state (memory/cron/acp/session). Best-effort + reported.
-    let owned = crate::agent_owned_state::cascade_rename_agent(
+    let owned = zeroclaw_runtime::agent_owned_state::cascade_rename_agent(
         &cfg,
-        &state.mem,
+        Some(&state.mem),
         state.session_backend.as_ref(),
         from,
         to,

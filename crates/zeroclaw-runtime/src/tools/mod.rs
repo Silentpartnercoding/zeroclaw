@@ -1400,7 +1400,7 @@ pub fn all_tools_with_runtime(
                     .legacy_owner_agent
                     .as_ref()
                     .map(|owner| owner.as_str())
-                    .or_else(|| (enabled_agents.len() == 1).then_some(enabled_agents[0]));
+                    .or_else(|| (enabled_agents.len() == 1).then(|| enabled_agents[0]));
                 match graph.prepare_legacy_ownership(legacy_owner) {
                     Ok(_) => {
                         // The scope is bound from the trusted registration alias,
@@ -2722,6 +2722,72 @@ mod tests {
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn knowledge_tool_registration_fails_closed_with_no_enabled_agents() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        cfg.agents.clear();
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &cfg.knowledge.resolved_db_path(),
+            cfg.knowledge.max_nodes,
+        )
+        .unwrap();
+        graph
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::unrestricted(),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Legacy pattern",
+                "No owner candidate",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(graph);
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "missing-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        assert!(
+            tools.into_iter().all(|tool| tool.name() != "knowledge"),
+            "legacy rows with no enabled owner candidate must disable the tool without panicking"
+        );
     }
 
     #[test]

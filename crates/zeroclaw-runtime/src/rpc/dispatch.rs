@@ -600,7 +600,7 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    async fn agent_rename_residue_exists(
+    async fn agent_owned_state_residue_exists(
         &self,
         config: &zeroclaw_config::schema::Config,
         from: &str,
@@ -610,7 +610,7 @@ impl RpcDispatcher {
         }
         if crate::cron::list_jobs_by_agent(config, from)
             .map(|jobs| !jobs.is_empty())
-            .unwrap_or(false)
+            .unwrap_or(true)
         {
             return true;
         }
@@ -618,17 +618,28 @@ impl RpcDispatcher {
             && store
                 .list_sessions_by_agent(from)
                 .map(|sessions| !sessions.is_empty())
-                .unwrap_or(false)
+                .unwrap_or(true)
         {
             return true;
         }
         if let Some(mem) = self.ctx.memory.as_ref()
-            && mem.count_agent(from).await.unwrap_or(0) > 0
+            && mem.count_agent(from).await.unwrap_or(1) > 0
         {
             return true;
         }
+        let knowledge_path = config.knowledge.resolved_db_path();
+        if knowledge_path.exists() {
+            match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+                &knowledge_path,
+                config.knowledge.max_nodes,
+            ) {
+                Ok(graph) if graph.count_owner(from).unwrap_or(1) > 0 => return true,
+                Err(_) => return true,
+                Ok(_) => {}
+            }
+        }
         if let Some(backend) = self.ctx.session_backend.as_ref()
-            && backend.count_agent_attribution(from).unwrap_or(0) > 0
+            && backend.count_agent_attribution(from).unwrap_or(1) > 0
         {
             return true;
         }
@@ -3133,6 +3144,14 @@ impl RpcDispatcher {
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        if matches!(
+            zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path),
+            Some(zeroclaw_config::alias_refs::AliasKind::Agent)
+        ) {
+            return self
+                .handle_config_agent_delete(req, config_write_guard)
+                .await;
+        }
         let deleted = {
             let mut config = self.ctx.config.write();
             let deleted = config
@@ -3150,6 +3169,136 @@ impl RpcDispatcher {
             path: req.path,
             key: req.key,
             deleted,
+            owned_state: None,
+        })
+    }
+
+    async fn handle_config_agent_delete(
+        &self,
+        req: ConfigMapKeyDeleteParams,
+        config_write_guard: ConfigWriteGuard,
+    ) -> RpcResult {
+        use zeroclaw_config::alias_refs::{AliasKind, CascadePolicy};
+
+        let active = self
+            .ctx
+            .sessions
+            .count_by_agent()
+            .await
+            .get(&req.key)
+            .copied()
+            .unwrap_or(0);
+        if active > 0 {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "{}.{}: cannot delete agent with {active} active RPC session(s); close those sessions first",
+                    req.path, req.key
+                ),
+            ));
+        }
+
+        let mut working = self.ctx.config.read().clone();
+        let configured = working.agent(&req.key).is_some();
+        let resume_committed_delete = !configured
+            && self
+                .agent_owned_state_residue_exists(&working, &req.key)
+                .await;
+        if !configured && !resume_committed_delete {
+            return to_result(ConfigMapKeyDeleteResult {
+                path: req.path,
+                key: req.key,
+                deleted: false,
+                owned_state: None,
+            });
+        }
+
+        let workspace = working.agent_workspace_dir(&req.key);
+        if configured {
+            let plan =
+                zeroclaw_config::alias_refs::plan_delete(&working, &AliasKind::Agent, &req.key);
+            let live_acp = crate::agent_owned_state::live_acp_session_count(&working, &req.key)
+                .map_err(|error| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "cannot delete agent `{}`: could not verify live ACP sessions ({error}); refusing to avoid orphaning active sessions",
+                            req.key
+                        ),
+                    )
+                })?;
+            if !plan.allowed || live_acp > 0 {
+                let mut reasons: Vec<String> = plan
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{} (hard config reference)", blocker.path))
+                    .collect();
+                if live_acp > 0 {
+                    reasons.push(format!("{live_acp} live ACP session(s); end them first"));
+                }
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("cannot delete agent `{}`: {}", req.key, reasons.join("; ")),
+                ));
+            }
+
+            let cascade = zeroclaw_config::alias_refs::delete_with_cascade(
+                &mut working,
+                &AliasKind::Agent,
+                &req.key,
+                CascadePolicy::RefuseOnHard,
+            )
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+            for path in cascade.dirty_paths() {
+                working.mark_dirty(&path);
+            }
+            self.save_and_swap_config(working.clone(), &config_write_guard)
+                .await?;
+        }
+
+        // The config deletion is durable (or a prior call already committed
+        // it). Release before filesystem and store I/O so unrelated config
+        // mutations are not blocked by the retryable owned-state cascade.
+        drop(config_write_guard);
+        let committed = self.ctx.config.read().clone();
+        let archive =
+            crate::agent_owned_state::archive_agent_workspace(&committed, &req.key, &workspace)
+                .await;
+        let mut owned = crate::agent_owned_state::cascade_owned_state(
+            &committed,
+            self.ctx.memory.as_ref(),
+            self.ctx.session_backend.as_ref(),
+            &req.key,
+            &archive.path,
+        )
+        .await;
+        if !archive.warnings.is_empty() {
+            owned.warnings.splice(0..0, archive.warnings);
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "agent": req.key,
+                    "memory": owned.memory_purged,
+                    "knowledge": owned.knowledge_purged,
+                    "knowledge_foreign_edges": owned.knowledge_foreign_edges_purged,
+                    "cron": owned.cron_removed,
+                    "acp": owned.acp_removed,
+                    "sessions_cleared": owned.sessions_cleared,
+                    "archive": owned.archived_to,
+                    "warnings": owned.warnings,
+                })
+            ),
+            "agent deleted with RPC owned-state cascade"
+        );
+
+        to_result(ConfigMapKeyDeleteResult {
+            path: req.path,
+            key: req.key,
+            deleted: true,
+            owned_state: Some(owned),
         })
     }
 
@@ -3234,7 +3383,9 @@ impl RpcDispatcher {
             let resume_committed_to = is_agent
                 && working.agent(&req.from).is_none()
                 && working.agent(&req.to).is_some()
-                && self.agent_rename_residue_exists(&working, &req.from).await;
+                && self
+                    .agent_owned_state_residue_exists(&working, &req.from)
+                    .await;
 
             if !resume_committed_to {
                 let report = zeroclaw_config::alias_refs::rename_with_cascade(
@@ -3261,9 +3412,29 @@ impl RpcDispatcher {
             let mut warnings = Vec::new();
             if let (Some(old_workspace), Some(new_workspace)) = (old_workspace, new_workspace) {
                 warnings.extend(move_renamed_agent_workspace(&old_workspace, &new_workspace).await);
-                warnings.extend(
-                    self.rename_agent_owned_state(&working, &req.from, &req.to)
-                        .await,
+                let owned = crate::agent_owned_state::cascade_rename_agent(
+                    &working,
+                    self.ctx.memory.as_ref(),
+                    self.ctx.session_backend.as_ref(),
+                    &req.from,
+                    &req.to,
+                )
+                .await;
+                warnings.extend(owned.warnings);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "from": req.from,
+                            "to": req.to,
+                            "memory": owned.memory_rows,
+                            "knowledge": owned.knowledge_rows,
+                            "cron": owned.cron_jobs,
+                            "acp": owned.acp_sessions,
+                            "sessions": owned.sessions_repointed,
+                            "warnings": warnings,
+                        })),
+                    "agent renamed with RPC owned-state cascade"
                 );
             }
 
@@ -3275,64 +3446,6 @@ impl RpcDispatcher {
                 warnings,
             })
         })
-    }
-
-    async fn rename_agent_owned_state(
-        &self,
-        config: &zeroclaw_config::schema::Config,
-        from: &str,
-        to: &str,
-    ) -> Vec<String> {
-        let mut warnings = Vec::new();
-        let mut memory_rows = 0usize;
-        let mut cron_jobs = 0usize;
-        let mut acp_sessions = 0usize;
-        let mut sessions_repointed = 0usize;
-
-        if let Some(mem) = &self.ctx.memory {
-            match mem.rename_agent(from, to).await {
-                Ok(n) => memory_rows = n,
-                Err(e) => warnings.push(format!("memory rename: {e}")),
-            }
-        }
-
-        match crate::cron::rename_jobs_by_agent(config, from, to) {
-            Ok(n) => cron_jobs = n,
-            Err(e) => warnings.push(format!("cron rename: {e}")),
-        }
-
-        match &self.ctx.acp_session_store {
-            Some(store) => match store.rename_sessions_by_agent(from, to) {
-                Ok(n) => acp_sessions = n,
-                Err(e) => warnings.push(format!("acp rename: {e}")),
-            },
-            None => warnings.push("acp store unavailable".to_string()),
-        }
-
-        if let Some(backend) = &self.ctx.session_backend {
-            match backend.rename_agent_attribution(from, to) {
-                Ok(n) => sessions_repointed = n,
-                Err(e) => warnings.push(format!("session attribution rename: {e}")),
-            }
-        }
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "memory": memory_rows,
-                    "cron": cron_jobs,
-                    "acp": acp_sessions,
-                    "sessions": sessions_repointed,
-                    "warnings": warnings.clone(),
-                })
-            ),
-            "agent renamed with RPC owned-state cascade"
-        );
-
-        warnings
     }
 
     fn handle_config_templates(&self) -> RpcResult {
@@ -7497,6 +7610,11 @@ mod tests {
             data_dir: tmp.path().join("data"),
             ..Default::default()
         };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         config.heartbeat.enabled = true;
         config.heartbeat.agent = "alpha".to_string();
         config.acp.default_agent = Some("alpha".to_string());
@@ -7532,6 +7650,27 @@ mod tests {
     async fn config_map_key_rename_uses_agent_cascade() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_agent_rename_test_config(&tmp);
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge_max_nodes = config.knowledge.max_nodes;
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            knowledge_max_nodes,
+        )
+        .unwrap();
+        graph
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                    "alpha",
+                    Vec::<String>::new(),
+                ),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Alpha knowledge",
+                "must follow the alias",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(graph);
         let data_dir = config.data_dir.clone();
         let (dispatcher, _sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -7591,6 +7730,14 @@ mod tests {
         assert!(!written.contains("[agents.alpha]"), "{written}");
         assert!(written.contains("agent = \"beta\""), "{written}");
         assert!(written.contains("default_agent = \"beta\""), "{written}");
+
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            knowledge_max_nodes,
+        )
+        .unwrap();
+        assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+        assert_eq!(graph.count_owner("beta").unwrap(), 1);
     }
 
     #[tokio::test]
@@ -7608,6 +7755,27 @@ mod tests {
             "beta",
         )
         .expect("seed config already committed to beta");
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge_max_nodes = config.knowledge.max_nodes;
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            knowledge_max_nodes,
+        )
+        .unwrap();
+        graph
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                    "alpha",
+                    Vec::<String>::new(),
+                ),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Lagged knowledge",
+                "must converge on retry",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(graph);
         let new_workspace = config.agent_workspace_dir("beta");
         let data_dir = config.data_dir.clone();
         let (dispatcher, _sessions, _chat_backend, _acp_store) =
@@ -7633,6 +7801,187 @@ mod tests {
             new_workspace.join("marker.txt").exists(),
             "workspace residue should converge onto the renamed alias"
         );
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            knowledge_max_nodes,
+        )
+        .unwrap();
+        assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+        assert_eq!(graph.count_owner("beta").unwrap(), 1);
+    }
+
+    fn make_agent_delete_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config
+    }
+
+    fn seed_agent_knowledge(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        title: &str,
+    ) -> String {
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        graph
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                    alias,
+                    Vec::<String>::new(),
+                ),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                title,
+                "owned lifecycle proof",
+                &[],
+                None,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_archives_and_purges_agent_knowledge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_delete_test_config(&tmp);
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let deleted_node = seed_agent_knowledge(&config, "alpha", "Deleted knowledge");
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let beta = zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+            "beta",
+            vec!["alpha".to_string()],
+        );
+        let surviving_node = graph
+            .add_node(
+                &beta,
+                zeroclaw_memory::knowledge_graph::NodeType::Technology,
+                "Surviving knowledge",
+                "foreign relationship owner",
+                &[],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_edge(
+                &beta,
+                &surviving_node,
+                &deleted_node,
+                zeroclaw_memory::knowledge_graph::Relation::Uses,
+            )
+            .unwrap();
+        drop(graph);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("agent delete must succeed");
+
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["owned_state"]["knowledge_purged"], 2);
+        assert_eq!(result["owned_state"]["knowledge_foreign_edges_purged"], 1);
+        let archive = std::path::PathBuf::from(
+            result["owned_state"]["archived_to"]
+                .as_str()
+                .expect("delete response exposes archive path"),
+        );
+        assert!(archive.join("cascade/knowledge.json").exists());
+        let archived_knowledge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("cascade/knowledge.json")).unwrap())
+                .unwrap();
+        let affected = archived_knowledge["affected_foreign_edges"]
+            .as_array()
+            .unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0]["owner_agent"], "beta");
+        assert_eq!(affected[0]["from_id"], surviving_node);
+        assert_eq!(affected[0]["to_id"], deleted_node);
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            dispatcher.ctx.config.read().knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+        assert!(graph.get_node(&beta, &surviving_node).unwrap().is_some());
+        assert!(
+            graph
+                .find_outbound(&beta, &surviving_node, 10)
+                .unwrap()
+                .is_empty(),
+            "the archived foreign relationship must be explicitly removed"
+        );
+        assert!(
+            graph
+                .get_node(
+                    &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                        "alpha",
+                        Vec::<String>::new(),
+                    ),
+                    &deleted_node,
+                )
+                .unwrap()
+                .is_none(),
+            "reusing the old alias must not expose deleted knowledge"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_resumes_committed_agent_knowledge_purge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        seed_agent_knowledge(&config, "alpha", "Lagged delete knowledge");
+        zeroclaw_config::alias_refs::delete_with_cascade(
+            &mut config,
+            &zeroclaw_config::alias_refs::AliasKind::Agent,
+            "alpha",
+            zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .expect("seed config deletion committed before owned-state purge");
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("re-issued delete must converge lagging owned state");
+
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["owned_state"]["knowledge_purged"], 1);
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            dispatcher.ctx.config.read().knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(graph.count_owner("alpha").unwrap(), 0);
     }
 
     #[test]
