@@ -191,13 +191,15 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
         let mut inner = limited.into_inner();
         discard_until_newline(&mut inner)?;
         return Ok(CappedLine::Truncated);
-    } else if raw.last() == Some(&b'\n') {
+    }
+    let had_trailing_newline = raw.last() == Some(&b'\n');
+    if had_trailing_newline {
         // Strip the trailing `\n` that `read_until` leaves behind. The
         // lossy decode runs after the strip so the result has no
         // trailing newline regardless of the cap path.
         raw.pop();
     }
-    if raw.is_empty() {
+    if raw.is_empty() && !had_trailing_newline {
         return Ok(CappedLine::Eof);
     }
     Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
@@ -377,9 +379,11 @@ impl InteractiveInputTask {
             .name("zeroclaw-interactive-input".to_string())
             .spawn(move || {
                 let stdin = std::io::stdin();
-                let mut reader = stdin.lock();
                 while request_rx.blocking_recv().is_some() {
-                    let result = read_capped_line(&mut reader, MAX_INTERACTIVE_INPUT_BYTES);
+                    let result = {
+                        let mut reader = stdin.lock();
+                        read_capped_line(&mut reader, MAX_INTERACTIVE_INPUT_BYTES)
+                    };
                     let terminal = interactive_input_result_is_terminal(&result);
                     if result_tx.blocking_send(result).is_err() || terminal {
                         break;
@@ -16484,6 +16488,9 @@ Let me check the result."#;
     fn interactive_signal_lifecycle_input_worker_stops_only_at_eof() {
         assert!(interactive_input_result_is_terminal(&Ok(CappedLine::Eof)));
         assert!(!interactive_input_result_is_terminal(&Ok(
+            CappedLine::Line(String::new())
+        )));
+        assert!(!interactive_input_result_is_terminal(&Ok(
             CappedLine::Truncated
         )));
         assert!(!interactive_input_result_is_terminal(&Err(
@@ -16652,6 +16659,94 @@ Let me check the result."#;
         drop(result_tx);
         signal_thread.join().expect("Ctrl+C generator thread");
         signal_task.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_input_lifecycle_windows_releases_stdin_for_approval() {
+        use std::io::{Read, Write};
+        use std::process::Stdio;
+
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let mut child = std::process::Command::new(current_exe)
+            .args([
+                "interactive_input_lifecycle_windows_releases_stdin_for_approval_child_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Windows stdin ownership helper process should start");
+
+        child
+            .stdin
+            .take()
+            .expect("helper stdin pipe")
+            .write_all(b"first line\ny\n")
+            .expect("write interactive and approval input");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("query helper process status") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().expect("terminate timed-out helper process");
+                break child.wait().expect("reap timed-out helper process");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .expect("helper stdout pipe")
+            .read_to_string(&mut stdout)
+            .expect("read helper stdout");
+        child
+            .stderr
+            .take()
+            .expect("helper stderr pipe")
+            .read_to_string(&mut stderr)
+            .expect("read helper stderr");
+
+        assert!(
+            !timed_out,
+            "Windows approval deadlocked on stdin after interactive input\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            status.success(),
+            "Windows stdin ownership helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess helper for the Windows interactive stdin ownership regression"]
+    async fn interactive_input_lifecycle_windows_releases_stdin_for_approval_child_helper() {
+        let mut input = InteractiveInputTask::spawn().expect("spawn interactive input task");
+        input
+            .request_line()
+            .expect("request first interactive line");
+        match input.result_rx.recv().await {
+            Some(Ok(CappedLine::Line(line))) => assert_eq!(line, "first line"),
+            other => panic!("expected first interactive line, got {other:?}"),
+        }
+
+        let manager = crate::approval::ApprovalManager::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let response = manager.prompt_cli(&crate::approval::ApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "echo approved"}),
+        });
+        assert_eq!(response, crate::approval::ApprovalResponse::Yes);
     }
 
     /// When the caller pre-mints a turn id (`process_message` does, so its
@@ -17318,6 +17413,23 @@ Pin 13: LED
             CappedLine::Line(line) => assert_eq!(line, "no newline at eof"),
             other => panic!("expected Line, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_capped_line_keeps_blank_lines_distinct_from_eof() {
+        let mut cursor = std::io::Cursor::new(b"\nnext prompt\n".to_vec());
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert!(line.is_empty()),
+            other => panic!("expected blank Line, got {other:?}"),
+        }
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "next prompt"),
+            other => panic!("expected subsequent Line, got {other:?}"),
+        }
+        assert!(matches!(
+            read_capped_line(&mut cursor, 1024).unwrap(),
+            CappedLine::Eof
+        ));
     }
 
     #[test]
