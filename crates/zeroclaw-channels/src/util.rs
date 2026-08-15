@@ -79,7 +79,7 @@ pub(crate) async fn spawn_raw_http_response(
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
+    let server = zeroclaw_spawn::spawn!(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0_u8; 1024];
         let _ = socket.read(&mut request).await.unwrap();
