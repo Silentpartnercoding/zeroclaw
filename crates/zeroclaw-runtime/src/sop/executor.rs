@@ -222,12 +222,7 @@ impl SopDriverSink {
             self.audit.clone(),
             action.clone(),
         );
-        let mut handles = match self.handles.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        handles.retain(|h| !h.is_finished());
-        handles.push(driver);
+        register_sop_driver(&self.handles, driver);
     }
 }
 
@@ -242,6 +237,19 @@ pub fn spawn_headless_run_driver(
     })
 }
 
+/// Register a headless driver in a generation-owned handle set: prune the
+/// finished entries, then add the new one. The set's owner (the daemon
+/// generation's driver supervisor) drains it at reload and shutdown, which is
+/// what keeps every registered driver inside one configuration boundary.
+pub fn register_sop_driver(handles: &SopDriverHandles, handle: tokio::task::JoinHandle<()>) {
+    let mut guard = match handles.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.retain(|existing| !existing.is_finished());
+    guard.push(handle);
+}
+
 /// Drive a broker-approved run from a headless approval surface.
 ///
 /// Every transport that resolves through `SopEngine::resolve_via_broker` calls
@@ -252,20 +260,23 @@ pub fn drive_resumed_broker_action(
     config: &zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    handles: Option<&SopDriverHandles>,
     outcome: &BrokerOutcome,
 ) {
     let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
         return;
     };
 
-    // Detached: an approval resolved over HTTP/WS has no caller lifetime to
-    // drain against, so the driver outlives the transport that released it.
-    drop(spawn_headless_run_driver(
-        config.clone(),
-        engine,
-        audit,
-        action.as_ref().clone(),
-    ));
+    let handle = spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+    match handles {
+        // Generation-owned: the daemon's driver supervisor drains this set at
+        // reload and shutdown, so an approval-resumed driver cannot keep
+        // working under superseded configuration unobserved.
+        Some(handles) => register_sop_driver(handles, handle),
+        // No generation supervisor on this surface (a one-shot command): the
+        // process ends with the command, so the driver cannot outlive policy.
+        None => drop(handle),
+    }
 }
 
 /// Resolve the agent a headless `ExecuteStep` runs as, failing closed.

@@ -4257,24 +4257,40 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
+                // The generation-owned driver supervisor: exists whenever the
+                // SOP engine does, whether or not the maintenance tick runs.
+                let sop_driver_supervisor = if sop_engine.is_some() {
+                    Some(SopDriverSupervisor::new(std::mem::take(
+                        &mut carried_sop_drivers,
+                    )))
+                } else {
+                    let carried = std::mem::take(&mut carried_sop_drivers);
+                    if !carried.is_empty() {
+                        // No generation to adopt them: re-aborted and reported
+                        // rather than silently dropped. Production drops the
+                        // reaper's handle; the reaper owns the drivers.
+                        drop(reap_orphaned_sop_drivers(carried));
+                    }
+                    None
+                };
                 let sop_maintenance = spawn_sop_maintenance(
                     &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
-                    std::mem::take(&mut carried_sop_drivers),
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
-                // The shared driver supervisor for channel-started runs: built on
-                // the SAME handle set the SOP maintenance drains, so a run driven
-                // from channel ingress and one driven from a cron tick are owned
-                // by one reload/shutdown boundary.
-                let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
-                    (Some(maintenance), Some(engine)) => {
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
                         Some(zeroclaw_runtime::sop::SopDriverSink::new(
                             current_config.clone(),
                             std::sync::Arc::clone(engine),
                             sop_audit.clone(),
-                            maintenance.drivers.clone(),
+                            supervisor.drivers.clone(),
                         ))
                     }
                     _ => None,
@@ -4284,10 +4300,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_dh = sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone());
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_handles = sop_dh.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -4299,6 +4319,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                sop_driver_handles,
                                 ready_tx,
                             ))
                             .await
@@ -4404,7 +4425,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
-                registry.set_sop_engine(sop_engine, sop_audit);
+                registry.set_sop_engine(
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
+                );
 
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
@@ -4419,10 +4446,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // engine: in-flight cron drivers hold this generation's config
                 // and engine, so they must not straddle the rebuild.
                 if let Some(maintenance) = sop_maintenance {
+                    // Producer first: no new driver can register while the
+                    // supervisor's drain runs.
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
                     // Anything still running is carried into the next
                     // generation rather than detached, so a driver that has not
                     // yet reached an await point stays owned and observable.
-                    carried_sop_drivers = maintenance.shutdown().await;
+                    carried_sop_drivers = supervisor.shutdown().await;
                 }
                 let exit = exit?;
                 match exit {
@@ -5059,24 +5091,27 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_driver_supervisor = sop_engine
+                    .as_ref()
+                    .map(|_| SopDriverSupervisor::new(Vec::new()));
                 let sop_maintenance = spawn_sop_maintenance(
                     &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
-                    Vec::new(),
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
-                // The shared driver supervisor for channel-started runs: built on
-                // the SAME handle set the SOP maintenance drains, so a run driven
-                // from channel ingress and one driven from a cron tick are owned
-                // by one reload/shutdown boundary.
-                let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
-                    (Some(maintenance), Some(engine)) => {
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
                         Some(zeroclaw_runtime::sop::SopDriverSink::new(
                             config.clone(),
                             std::sync::Arc::clone(engine),
                             sop_audit.clone(),
-                            maintenance.drivers.clone(),
+                            supervisor.drivers.clone(),
                         ))
                     }
                     _ => None,
@@ -5095,9 +5130,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // but drivers still hold the engine; drain them before the
                 // process tears the subsystem down.
                 if let Some(maintenance) = sop_maintenance {
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
                     // No next generation on this path: the process exits after
                     // `channel start` returns, which ends any straggler.
-                    drop(maintenance.shutdown().await);
+                    drop(supervisor.shutdown().await);
                 }
                 result
             }
@@ -8035,41 +8073,21 @@ fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-    // Drivers a previous generation aborted that had not stopped yet. This
-    // generation adopts them so they stay tracked; if there is no generation to
-    // adopt them (SOP maintenance is off in the new config) they are re-aborted
-    // and reported rather than silently dropped.
-    carried: Vec<tokio::task::JoinHandle<()>>,
+    // The generation's supervisor set: the tick registers every driver it
+    // starts here, and the supervisor — not this ticker — owns the drain.
+    drivers: Option<SopDriverSet>,
 ) -> Option<SopMaintenance> {
-    let disown = |carried: Vec<tokio::task::JoinHandle<()>>| {
-        // Production drops the reaper's handle: the reaper is what owns the
-        // drivers, so nothing else needs to hold it.
-        drop(reap_orphaned_sop_drivers(carried));
-    };
     if interval_secs == 0 {
-        disown(carried);
         return None;
     }
-    let Some(engine) = sop_engine.cloned() else {
-        disown(carried);
-        return None;
-    };
+    let engine = sop_engine.cloned()?;
+    let drivers = drivers?;
     let audit = sop_audit.cloned();
     let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    let drivers = SopDriverSet::default();
-    let tick_drivers = drivers.clone();
-    if !carried.is_empty() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"carried": carried.len()})),
-            "Adopted SOP cron driver(s) that a previous generation aborted but that had not \
-             stopped; this generation tracks them until they do"
-        );
-    }
+    let tick_drivers = drivers;
     let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -8105,18 +8123,14 @@ fn spawn_sop_maintenance(
             }
         }
     });
-    Some(SopMaintenance {
-        ticker,
-        drivers,
-        carried,
-    })
+    Some(SopMaintenance { ticker })
 }
 
-/// In-flight cron-started headless drivers for one daemon generation.
+/// In-flight headless drivers for one daemon generation — cron-started,
+/// channel-started, and approval-resumed alike.
 ///
-/// Shared between the maintenance tick (which pushes each driver it launches
-/// and prunes finished ones) and the daemon loop (which drains them before
-/// rebuilding the SOP subsystem).
+/// Shared between every producer that registers drivers and the
+/// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
 #[cfg(feature = "agent-runtime")]
 type SopDriverSet = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
 
@@ -8133,16 +8147,24 @@ const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 #[cfg(feature = "agent-runtime")]
 const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// One daemon generation's SOP maintenance: the tick task plus every cron
-/// driver it started.
-///
-/// A cron driver captures this generation's `Config` and `SopEngine`. Reload
-/// re-reads config and builds a fresh engine, so a driver that outlives the
-/// generation would keep doing model and tool work under superseded policy.
-/// The whole set is therefore torn down before the daemon loop rebuilds.
+/// One daemon generation's SOP maintenance tick. The drivers the tick starts
+/// register in the generation's [`SopDriverSupervisor`], which owns the drain;
+/// stopping the tick (see [`Self::stop`]) only guarantees no further producer
+/// runs while that drain finalizes the set.
 #[cfg(feature = "agent-runtime")]
 struct SopMaintenance {
     ticker: tokio::task::JoinHandle<()>,
+}
+
+/// One daemon generation's headless-driver supervisor. Every driver the
+/// generation starts — a cron tick, channel ingress, or an approval resume —
+/// registers in `drivers`, and teardown drains the set before the loop
+/// rebuilds, so no headless work straddles a reload unowned.
+///
+/// Exists whenever the SOP engine exists; the maintenance ticker is one
+/// producer among several, not the owner.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverSupervisor {
     drivers: SopDriverSet,
     /// Drivers a previous generation aborted that had not stopped by the time
     /// its teardown returned.
@@ -8160,12 +8182,38 @@ struct SopMaintenance {
 
 #[cfg(feature = "agent-runtime")]
 impl SopMaintenance {
-    /// Stop the tick, then let in-flight drivers finish under the configuration
-    /// they started with, aborting — and then joining — any that overrun
-    /// [`SOP_DRIVER_DRAIN_TIMEOUT`].
-    ///
-    /// The tick is aborted first so no new driver can join the set while the
-    /// drain is running.
+    /// Abort the tick and JOIN it. `abort` only requests cancellation, and a
+    /// tick already inside its body can still spawn and register a driver;
+    /// awaiting the aborted handle is what guarantees no new producer runs
+    /// while the supervisor's drain below finalizes the set.
+    async fn stop(self) {
+        self.ticker.abort();
+        let _ = self.ticker.await;
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopDriverSupervisor {
+    fn new(carried: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        if !carried.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"carried": carried.len()})),
+                "Adopted SOP driver(s) that a previous generation aborted but that had not \
+                 stopped; this generation tracks them until they do"
+            );
+        }
+        Self {
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+    }
+
+    /// Let in-flight drivers finish under the configuration they started
+    /// with, aborting — and then joining — any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`]. The caller must stop every producer
+    /// (the maintenance tick, via [`SopMaintenance::stop`]) first.
     ///
     /// Returns the drivers that were still running when this returned: aborted,
     /// but not yet stopped, because cancellation only lands at a task's next
@@ -8189,14 +8237,6 @@ impl SopMaintenance {
         drain_timeout: std::time::Duration,
         abort_join_timeout: std::time::Duration,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        self.ticker.abort();
-        // Joined, not just aborted: `abort` requests cancellation, so a tick
-        // already inside `check_sop_cron_triggers` can still spawn and register
-        // a driver. Awaiting the aborted handle (it resolves `Err(Cancelled)`
-        // at the task's next await point) is what guarantees the set below is
-        // final — otherwise a late driver would be detached and outlive this
-        // generation, which is the leak this whole type exists to prevent.
-        let _ = self.ticker.await;
         // Adopted from an earlier generation: already aborted, so they are
         // re-checked rather than re-waited. Anything still running is handed
         // forward again below.
@@ -8428,7 +8468,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -10388,6 +10428,113 @@ mod tests {
         );
     }
 
+    /// With the maintenance tick disabled entirely, the generation's driver
+    /// supervisor must still exist and drive channel-started work: a file
+    /// event through the production filesystem adapter starts an auto-mode
+    /// SOP whose driver registers in the supervisor's set and completes under
+    /// the SOP's own agent. Guards the conditional sink construction and the
+    /// adapter wiring, which a dispatch-helper regression cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn filesystem_adapter_drives_a_run_with_maintenance_disabled() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        let watch = tempfile::tempdir().expect("watch dir");
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "fs-sop".into(),
+                description: "maintenance-disabled adapter regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Filesystem {
+                    path: watch.path().to_string_lossy().into_owned(),
+                    events: vec![],
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        // No maintenance tick exists anywhere in this test: the supervisor's
+        // set stands alone, exactly as when `maintenance_interval_secs == 0`.
+        let supervisor_set = zeroclaw_runtime::sop::SopDriverHandles::default();
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            supervisor_set.clone(),
+        );
+        let channel = zeroclaw_channels::filesystem::FilesystemChannel::new(
+            zeroclaw_channels::filesystem::FilesystemChannelConfig {
+                config: zeroclaw_config::schema::FilesystemConfig {
+                    enabled: true,
+                    paths: vec![watch.path().to_string_lossy().into_owned()],
+                    events: vec!["created".into(), "modified".into()],
+                    debounce_ms: 50,
+                    ..Default::default()
+                },
+                alias: "fswatch".into(),
+                engine: std::sync::Arc::clone(&harness.engine),
+                audit: std::sync::Arc::clone(&harness.audit),
+                driver_sink: Some(sink),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = tokio::spawn(async move {
+            use zeroclaw_api::channel::Channel;
+            let _ = channel.listen(tx).await;
+        });
+        // Give the watcher a beat to arm before the event lands.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(watch.path().join("event.txt"), "review please").expect("write event");
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if let Some(run) = engine.finished_runs(Some("fs-sop")).first() {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a file event must start and finish a run with no maintenance tick");
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "{:?}",
+            run.step_results
+        );
+        assert!(
+            !supervisor_set.lock().unwrap().is_empty(),
+            "the driver must register in the supervisor set"
+        );
+        listener.abort();
+    }
+
     /// The channel half of the same gap: a channel-triggered auto SOP was
     /// admitted by the shared ingress and then stranded, because no caller of
     /// the ingress owned a driver for the run it had just started. With the
@@ -10647,14 +10794,10 @@ mod tests {
         });
         let drivers = SopDriverSet::default();
         drivers.lock().unwrap().push(driver);
-        let ticker = ::zeroclaw_spawn::spawn!(async {
-            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
-        });
 
         // Short deadlines so the drain-expiry path runs without waiting out the
         // production ones; the logic under test is identical.
-        let carried = SopMaintenance {
-            ticker,
+        let carried = SopDriverSupervisor {
             drivers,
             carried: Vec::new(),
         }
@@ -10759,12 +10902,7 @@ mod tests {
             guard.push(quick);
             guard.push(stuck);
         }
-        let ticker = ::zeroclaw_spawn::spawn!(async {
-            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
-        });
-
-        let carried = SopMaintenance {
-            ticker,
+        let carried = SopDriverSupervisor {
             drivers,
             carried: Vec::new(),
         }
@@ -10797,13 +10935,9 @@ mod tests {
         });
         let drivers = SopDriverSet::default();
         drivers.lock().unwrap().push(driver);
-        let ticker = ::zeroclaw_spawn::spawn!(async {
-            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
-        });
 
         let started = std::time::Instant::now();
-        let carried = SopMaintenance {
-            ticker,
+        let carried = SopDriverSupervisor {
             drivers,
             carried: Vec::new(),
         }
@@ -10826,8 +10960,7 @@ mod tests {
         // The next generation adopts it: already aborted, so it is re-checked
         // and handed on again without a second drain.
         let adopted_at = std::time::Instant::now();
-        let still_carried = SopMaintenance {
-            ticker: ::zeroclaw_spawn::spawn!(async {}),
+        let still_carried = SopDriverSupervisor {
             drivers: SopDriverSet::default(),
             carried,
         }

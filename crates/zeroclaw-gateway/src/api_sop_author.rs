@@ -597,6 +597,7 @@ pub async fn handle_sop_decide(
             &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
+            state.sop_driver_handles.as_ref(),
             &outcome,
         );
     }

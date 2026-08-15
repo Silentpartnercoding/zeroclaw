@@ -7331,10 +7331,12 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
+            let driver_handles = router.sop_driver_sink.as_ref().map(|sink| sink.handles());
             zeroclaw_runtime::sop::drive_resumed_broker_action(
                 config,
                 Arc::clone(engine),
                 router.sop_audit.clone(),
+                driver_handles.as_ref(),
                 &outcome,
             );
             ::zeroclaw_log::record!(
