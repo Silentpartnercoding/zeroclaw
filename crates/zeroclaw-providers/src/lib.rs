@@ -32,7 +32,8 @@ pub mod traits;
 pub mod vision_override;
 
 pub use anthropic::AnthropicRefusalError;
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 pub use safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
     scope_safeguard_fallback, take_last_safeguard_fallback,
