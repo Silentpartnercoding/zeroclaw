@@ -245,7 +245,7 @@ impl std::fmt::Display for OwnedSupervisionError {
 
 enum OwnedWorkerOutcome<T> {
     Completed(T),
-    Cancelled,
+    CancellationAcknowledged,
     RuntimeBuild(std::io::Error),
 }
 
@@ -291,12 +291,16 @@ where
             let outcome = runtime.block_on(async move {
                 tokio::select! {
                     biased;
-                    () = worker_cancellation.cancelled() => OwnedWorkerOutcome::Cancelled,
+                    () = worker_cancellation.cancelled() => {
+                        OwnedWorkerOutcome::CancellationAcknowledged
+                    },
                     value = operation => OwnedWorkerOutcome::Completed(value),
                 }
             });
-            // Dropping the runtime cancels and joins runtime-owned work before
-            // the caller is allowed to release its durable claim.
+            // Sending the acknowledgement only after the operation future is
+            // dropped and the private runtime is shut down is load-bearing:
+            // the durable caller must not release its claim while runtime-owned
+            // provider/tool/delivery work can still make progress.
             drop(runtime);
             let _ = tx.send(outcome);
         })
@@ -318,10 +322,12 @@ fn owned_worker_result<T>(
 ) -> Result<T, OwnedSupervisionError> {
     match result {
         Ok(OwnedWorkerOutcome::Completed(value)) => Ok(value),
-        Ok(OwnedWorkerOutcome::Cancelled) if deadline_elapsed => {
+        Ok(OwnedWorkerOutcome::CancellationAcknowledged) if deadline_elapsed => {
             Err(OwnedSupervisionError::DeadlineExceeded)
         }
-        Ok(OwnedWorkerOutcome::Cancelled) | Err(_) => Err(OwnedSupervisionError::WorkerStopped),
+        Ok(OwnedWorkerOutcome::CancellationAcknowledged) | Err(_) => {
+            Err(OwnedSupervisionError::WorkerStopped)
+        }
         Ok(OwnedWorkerOutcome::RuntimeBuild(error)) => {
             Err(OwnedSupervisionError::RuntimeBuild(error))
         }
@@ -457,8 +463,16 @@ pub async fn deliver_and_classify_run_result(
         let deadline = delivery_timeout();
         match supervise_owned(
             deadline,
-            Box::new(move |_| {
-                Box::pin(async move { deliver_if_configured(&d_config, &d_job, &d_output).await })
+            Box::new(move |cancellation| {
+                Box::pin(async move {
+                    deliver_if_configured_with_cancellation(
+                        &d_config,
+                        &d_job,
+                        &d_output,
+                        Some(&cancellation),
+                    )
+                    .await
+                })
             }),
         )
         .await
@@ -1627,6 +1641,18 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+    deliver_if_configured_with_cancellation(config, job, output, None).await
+}
+
+async fn deliver_if_configured_with_cancellation(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        anyhow::bail!("scheduled delivery cancelled before dispatch");
+    }
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -1664,12 +1690,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::Error::msg("delivery.to is required for announce mode")
     })?;
 
-    deliver_announcement(
+    deliver_announcement_with_cancellation(
         config,
         channel,
         target,
         delivery.thread_id.as_deref(),
         output,
+        cancellation,
     )
     .await
 }
@@ -1704,15 +1731,39 @@ pub async fn deliver_announcement(
     thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
+    deliver_announcement_with_cancellation(config, channel, target, thread_id, output, None).await
+}
+
+async fn deliver_announcement_with_cancellation(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        anyhow::bail!("scheduled delivery cancelled before dispatch");
+    }
     if let Some(f) = DELIVERY_FN.get() {
-        f(
+        let delivery = f(
             config.clone(),
             channel.to_string(),
             target.to_string(),
             thread_id.map(str::to_string),
             output.to_string(),
-        )
-        .await
+        );
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    anyhow::bail!("scheduled delivery cancelled before completion")
+                }
+                result = delivery => result,
+            }
+        } else {
+            delivery.await
+        }
     } else {
         ::zeroclaw_log::record!(
             WARN,
@@ -3133,7 +3184,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_setup_retains_one_owner_and_stops_before_provider_work() {
         let tmp = TempDir::new().unwrap();
-        let (addr, _accepts) = spawn_hanging_server().await;
+        let (addr, accepts) = spawn_hanging_server().await;
         let mut config = test_config_with_hanging_provider(&tmp, addr).await;
         config
             .runtime_profiles
@@ -3226,6 +3277,11 @@ mod tests {
             post_setup.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "provider/tool work after setup must not start once the deadline has fired"
+        );
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a provider connection must not start once the deadline has fired"
         );
         assert_eq!(
             active_workers.load(std::sync::atomic::Ordering::SeqCst),
@@ -4697,6 +4753,29 @@ mod tests {
 
         // Default delivery mode is not "announce", so should be a no-op.
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_scheduled_delivery_does_not_dispatch() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announce_job();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let before = DELIVERED.load(std::sync::atomic::Ordering::SeqCst);
+
+        let error =
+            deliver_if_configured_with_cancellation(&config, &job, "result", Some(&cancellation))
+                .await
+                .expect_err("a pre-cancelled delivery must not dispatch");
+
+        assert!(error.to_string().contains("cancelled before dispatch"));
+        assert_eq!(
+            DELIVERED.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the delivery handler must not run after cancellation"
+        );
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

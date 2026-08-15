@@ -675,6 +675,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let mut hook_selected_model = None;
 
         if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            ctx.ensure_not_cancelled()?;
             let mut candidate_model = active_model.to_string();
             match hooks
                 .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
@@ -687,6 +688,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     anyhow::bail!("LLM call cancelled by hook: {reason}");
                 }
             }
+            ctx.ensure_not_cancelled()?;
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
 
@@ -696,6 +698,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // first would claim the agent is waiting on a model that is never
         // called.
         enforce_tool_loop_budget()?;
+        ctx.ensure_not_cancelled()?;
 
         let llm_started_at = announce_llm_request(
             &ctx,
