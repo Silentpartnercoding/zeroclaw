@@ -860,13 +860,15 @@ fn reliable_terminal_error(
     refusal_seen: Option<AnthropicRefusalError>,
 ) -> anyhow::Error {
     if let Some(refusal) = refusal_seen {
-        let refusal = anyhow::Error::new(refusal).context(format!(
+        let attempts = format!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
-        ));
+        );
         return match rejected_attempt_usage {
-            Some(usage) => refusal.context(ReliableRejectedCompletionUsage { usage, failures }),
-            None => refusal,
+            Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage { usage, failures })
+                .context(refusal)
+                .context(attempts),
+            None => anyhow::Error::new(refusal).context(attempts),
         };
     }
 
@@ -3455,6 +3457,37 @@ mod tests {
         assert_eq!(rejected.usage.input_tokens, Some(20));
         assert_eq!(rejected.usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn terminal_refusal_retains_prior_rejected_usage() {
+        let error = reliable_terminal_error(
+            vec!["primary returned an empty completion".to_string()],
+            Some(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            false,
+            Some(AnthropicRefusalError {
+                requested_model: "claude-opus-4".to_string(),
+                category: Some("CATEGORY_SENTINEL".to_string()),
+            }),
+        );
+
+        assert!(error.downcast_ref::<AnthropicRefusalError>().is_some());
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive a terminal refusal");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "the refusal remains the terminal cause"
+        );
     }
 
     #[tokio::test]
