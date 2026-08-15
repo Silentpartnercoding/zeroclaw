@@ -174,6 +174,7 @@ impl SqliteSessionBackend {
     /// Migrate JSONL session files into SQLite. Renames migrated files to `.jsonl.migrated`.
     pub fn migrate_from_jsonl(&self, workspace_dir: &Path) -> Result<usize> {
         let sessions_dir = workspace_dir.join("sessions");
+        let jsonl_store = crate::session_store::SessionStore::new(workspace_dir)?;
         let entries = match std::fs::read_dir(&sessions_dir) {
             Ok(e) => e,
             Err(_) => return Ok(0),
@@ -215,9 +216,27 @@ impl SqliteSessionBackend {
             }
 
             if count > 0 {
+                if let Some(metadata) = jsonl_store.get_session_metadata(key) {
+                    if let Some(name) = metadata.name.as_deref() {
+                        self.set_session_name(key, name)?;
+                    }
+                    if let Some(agent_alias) = metadata.agent_alias.as_deref() {
+                        self.set_session_agent_alias(key, agent_alias)?;
+                    }
+                    self.set_session_context(
+                        key,
+                        SessionContext {
+                            channel_id: metadata.channel_id.as_deref(),
+                            room_id: metadata.room_id.as_deref(),
+                            sender_id: metadata.sender_id.as_deref(),
+                        },
+                    )?;
+                }
                 let migrated_path = path.with_extension("jsonl.migrated");
-                let _ = std::fs::rename(&path, &migrated_path);
-                migrated += 1;
+                if std::fs::rename(&path, &migrated_path).is_ok() {
+                    let _ = jsonl_store.mark_metadata_migrated(key);
+                    migrated += 1;
+                }
             }
         }
 
@@ -1190,6 +1209,40 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_ownership_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let jsonl = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+        jsonl.append("owned", &ChatMessage::user("hello")).unwrap();
+        jsonl.set_session_name("owned", "Operator chat").unwrap();
+        jsonl.set_session_agent_alias("owned", "rowan").unwrap();
+        jsonl
+            .set_session_context(
+                "owned",
+                SessionContext {
+                    channel_id: Some("discord.primary"),
+                    room_id: Some("42"),
+                    sender_id: Some("operator"),
+                },
+            )
+            .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+
+        let metadata = backend.get_session_metadata("owned").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Operator chat"));
+        assert_eq!(metadata.agent_alias.as_deref(), Some("rowan"));
+        assert_eq!(metadata.channel_id.as_deref(), Some("discord.primary"));
+        assert_eq!(metadata.room_id.as_deref(), Some("42"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("operator"));
+        assert!(
+            tmp.path()
+                .join("sessions/owned.metadata.json.migrated")
+                .exists()
+        );
     }
 
     #[test]

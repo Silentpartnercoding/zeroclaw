@@ -13479,7 +13479,8 @@ pub struct ChannelsConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
     /// Session persistence backend: `"jsonl"` (legacy) or `"sqlite"` (new default).
-    /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
+    /// JSONL keeps ownership and routing metadata in per-session sidecars. SQLite
+    /// additionally provides FTS5 search and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.

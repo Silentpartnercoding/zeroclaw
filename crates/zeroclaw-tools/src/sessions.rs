@@ -1624,6 +1624,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_jsonl_backend_supports_all_scoped_session_tools_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let backend = zeroclaw_infra::make_session_backend(tmp.path(), "jsonl").unwrap();
+            backend
+                .append("discord__operator", &ChatMessage::user("private turn"))
+                .unwrap();
+            backend
+                .set_session_agent_alias("discord__operator", "rowan")
+                .unwrap();
+        }
+
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "jsonl").unwrap();
+        let scope = SessionOwnershipScope::for_agent("rowan");
+
+        let listed =
+            SessionsListTool::for_agent(Arc::clone(&backend), test_security(), scope.clone())
+                .execute(json!({}))
+                .await
+                .unwrap();
+        assert!(listed.success);
+        assert!(listed.output.contains("discord__operator"));
+
+        let history =
+            SessionsHistoryTool::for_agent(Arc::clone(&backend), test_security(), scope.clone())
+                .execute(json!({"session_id": "discord__operator"}))
+                .await
+                .unwrap();
+        assert!(history.success);
+        assert!(history.output.contains("private turn"));
+
+        let sent = SessionsSendTool::for_agent(Arc::clone(&backend), test_security(), scope)
+            .execute(json!({
+                "session_id": "discord__operator",
+                "message": "owned follow-up"
+            }))
+            .await
+            .unwrap();
+        assert!(sent.success);
+        assert_eq!(
+            backend.load("discord__operator").last().unwrap().content,
+            "owned follow-up"
+        );
+    }
+
+    #[tokio::test]
     async fn send_scoped_denies_other_agent_session() {
         let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
             "telegram__alice",
