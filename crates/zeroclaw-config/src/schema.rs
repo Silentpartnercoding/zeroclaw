@@ -21617,13 +21617,50 @@ impl Config {
         self.dirty_paths.clear();
     }
 
+    /// Refuse paths whose bytes identify both a complete live map key and a
+    /// field below a shorter live key. Mutation routes to the shorter key,
+    /// while whole-entry persistence must treat the exact key as canonical;
+    /// rejecting before either operation keeps memory and disk aligned.
+    fn reject_ambiguous_persistent_map_key_path(&self, name: &str) -> Result<()> {
+        let Some(section) = find_map_key_section_for_path(name) else {
+            return Ok(());
+        };
+        let remainder = &name[section.path.len() + 1..];
+        let Some(keys) = self.get_map_keys(section.path) else {
+            return Ok(());
+        };
+        if !keys.iter().any(|key| key == remainder) {
+            return Ok(());
+        }
+
+        let Some((field_key, inner_name)) = crate::helpers::route_hashmap_path(
+            name,
+            "",
+            section.path,
+            "",
+            keys.iter().map(String::as_str),
+        ) else {
+            return Ok(());
+        };
+
+        anyhow::bail!(
+            "Ambiguous config path `{name}`: it could mean the map entry `{}[{:?}]` or property `{}[{:?}].{inner_name}`. Refusing to choose; rename one of the colliding map keys",
+            section.path,
+            remainder,
+            section.path,
+            field_key,
+        )
+    }
+
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
         Ok(())
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
         Ok(())
@@ -31189,6 +31226,67 @@ group_policy = "disabled"
                 .and_then(|r| r.input_per_mtok),
             Some(9.9),
             "reloaded config must see the persisted value; got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn set_prop_persistent_rejects_ambiguous_dotted_map_key_path_before_mutation() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let path = "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok";
+        let err = config
+            .set_prop_persistent(path, "9.9")
+            .expect_err("colliding whole-key and field interpretations must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1.input_per_mtok\"]"),
+            "error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1\"].input_per_mtok"),
+            "error must name the field interpretation: {message}"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "rejection must happen before the shorter key's field is mutated"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "rejection must not mutate the exact-key entry"
+        );
+        assert!(
+            !config.dirty_paths.contains(path),
+            "a rejected path must not be recorded as persistable"
         );
     }
 
