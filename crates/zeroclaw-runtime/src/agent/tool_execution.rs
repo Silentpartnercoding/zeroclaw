@@ -274,11 +274,6 @@ pub(crate) async fn execute_one_tool(
         execute.await
     }?;
 
-    // A tool may itself block synchronously and return after cancellation was
-    // requested. Retain its side effect under the old claim, but do not emit a
-    // late success or advance to another user-visible boundary.
-    ensure_tool_not_cancelled(cancellation_token)?;
-
     let outcome = {
         let _result_guard = tool_span.entered();
         match tool_result {

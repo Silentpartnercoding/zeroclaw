@@ -328,9 +328,13 @@ pub(crate) async fn call_provider(
     };
 
     // If a provider blocked synchronously inside one poll, cancellation could
-    // have arrived while it was running. Do not hand a late response to tool
-    // preparation after the durable owner requested shutdown.
-    ctx.ensure_not_cancelled()?;
+    // have arrived while it was running. Do not hand a late successful
+    // response to tool preparation after the durable owner requested
+    // shutdown. Preserve typed streaming/cancellation failures so already
+    // forwarded partial output and failure telemetry can still be finalized.
+    if chat_result.is_ok() {
+        ctx.ensure_not_cancelled()?;
+    }
 
     Ok(ProviderCallOutcome {
         chat_result,
