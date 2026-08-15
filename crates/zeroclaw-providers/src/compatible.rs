@@ -1390,15 +1390,20 @@ struct NativeChatRequest<T = Vec<NativeToolSpec>> {
 /// field is rejected exactly like one carrying `"high"`. The key is therefore
 /// inserted when missing.
 ///
-/// Returns `false` once the payload already states `"none"`, which is the
-/// fixed point that bounds the retry to a single additional request.
+/// Returns `false` once the payload already states exactly `"none"`, which is
+/// the fixed point that bounds the retry to a single additional request. The
+/// comparison is case-sensitive on purpose: a differently-spelled `"NONE"`
+/// supplied through `provider_extra` can be rejected by a case-sensitive
+/// endpoint, so it is normalized to the canonical lowercase value rather than
+/// treated as already repaired. Rewriting a non-canonical spelling still
+/// converges after one retry because the rewritten payload is the fixed point.
 fn ensure_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
     let Some(object) = payload.as_object_mut() else {
         return false;
     };
     if matches!(
         object.get("reasoning_effort"),
-        Some(serde_json::Value::String(effort)) if effort.eq_ignore_ascii_case("none")
+        Some(serde_json::Value::String(effort)) if effort == "none"
     ) {
         return false;
     }
@@ -4706,6 +4711,88 @@ mod tests {
             Some("high"),
             "the operator-configured effort must not be downgraded"
         );
+        server.abort();
+    }
+
+    #[test]
+    fn ensure_reasoning_effort_none_normalizes_non_canonical_spellings() {
+        // A case-sensitive endpoint can reject "NONE" supplied through
+        // provider_extra, so a non-canonical spelling must be rewritten to the
+        // exact lowercase value rather than counted as already repaired.
+        for spelling in ["NONE", "None", "nOnE"] {
+            let mut payload = serde_json::json!({ "reasoning_effort": spelling });
+            assert!(
+                ensure_reasoning_effort_none(&mut payload),
+                "{spelling} must be normalized to the canonical value"
+            );
+            assert_eq!(
+                payload.get("reasoning_effort"),
+                Some(&serde_json::Value::String("none".to_string()))
+            );
+            // The rewritten payload is the fixed point, so the retry stays
+            // bounded to a single additional request.
+            assert!(!ensure_reasoning_effort_none(&mut payload));
+        }
+
+        let mut canonical = serde_json::json!({ "reasoning_effort": "none" });
+        assert!(
+            !ensure_reasoning_effort_none(&mut canonical),
+            "exact lowercase none is the fixed point"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_retry_normalizes_uppercase_reasoning_effort_on_the_wire() {
+        // Wire-payload regression: an operator-supplied "NONE" reaches a
+        // case-sensitive endpoint, is rejected, and the retry must carry the
+        // canonical lowercase spelling.
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("NONE".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("NONE"),
+            "the first request preserves the operator-supplied spelling"
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "the retry must normalize to the canonical lowercase none"
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
         server.abort();
     }
 
