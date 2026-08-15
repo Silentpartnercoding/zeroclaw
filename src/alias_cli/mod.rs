@@ -454,7 +454,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
-    let live = crate::gateway::agent_owned_state::live_acp_session_count(config, alias)
+    let live = zeroclaw_runtime::agent_owned_state::live_acp_session_count(config, alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
         let count = live.to_string();
@@ -505,9 +505,9 @@ async fn agent_delete_owned_state(
             )
         );
     }
-    let report = crate::gateway::agent_owned_state::cascade_owned_state(
+    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
         config,
-        &mem,
+        Some(&mem),
         session_backend.as_ref(),
         alias,
         &archive_dir,
@@ -582,9 +582,9 @@ async fn agent_rename_owned_state(
         }
     }
     let (mem, session_backend) = build_owned_state_handles(config)?;
-    let report = crate::gateway::agent_owned_state::cascade_rename_agent(
+    let report = zeroclaw_runtime::agent_owned_state::cascade_rename_agent(
         config,
-        &mem,
+        Some(&mem),
         session_backend.as_ref(),
         from,
         to,
