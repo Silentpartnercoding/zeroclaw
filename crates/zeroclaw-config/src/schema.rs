@@ -21978,12 +21978,22 @@ async fn write_config_atomically_with_sync(
         // pins the backup data and directory entry across a crash. Any failure
         // here is still pre-commit and therefore returns with `config.toml`
         // unchanged.
-        let backup_file = File::open(&backup_path).await.with_context(|| {
-            format!(
-                "Failed to open config backup for fsync: {}",
-                backup_path.display()
-            )
-        })?;
+        // The handle must carry write access: on Windows `sync_all` reaches
+        // `FlushFileBuffers`, which rejects a handle opened without
+        // `GENERIC_WRITE`. `write(true)` without `truncate`/`create_new`
+        // keeps the freshly copied bytes intact and only widens the access
+        // rights, so the fsync below is portable rather than Unix-only.
+        let backup_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open config backup for fsync: {}",
+                    backup_path.display()
+                )
+            })?;
         backup_file
             .sync_all()
             .await
@@ -26954,6 +26964,52 @@ default_temperature = 0.7
             fs::read_to_string(&backup_path).await.unwrap(),
             "schema_version = 1\n",
             "durability uncertainty must retain the pre-replace backup"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn save_over_existing_config_syncs_backup_on_every_platform() {
+        // The backup fsync runs on the ordinary save-over-existing-config
+        // path, so the handle it uses must be valid at runtime, not merely
+        // compile. Opening the `.bak` copy read-only builds everywhere but
+        // fails under Windows `FlushFileBuffers`, which requires write
+        // access. Executing the real path here turns that into a test
+        // failure wherever the suite runs instead of a review-only catch.
+        // The companion fault-injection test asserts the retained backup
+        // still holds the pre-replace bytes, which is what proves the
+        // widened access rights do not truncate the recovery copy.
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_save_over_existing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::Real,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "saving over an existing config must not fail while syncing the backup: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the replacement must be visible after a committed save"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a fully durable save consumes the backup rather than leaving it behind"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
