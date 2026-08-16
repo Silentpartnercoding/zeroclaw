@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use zeroclaw_hardware::catalog::{BASE_TOOLS, DATASHEET_TOOLS};
+use zeroclaw_hardware::catalog::BASE_TOOLS;
 use zeroclaw_hardware::registry::known_boards;
 use zeroclaw_hardware::transport::TransportKind;
 
@@ -28,10 +28,6 @@ pub fn run(root: &Path) -> Result<()> {
     std::fs::write(
         dir.join("hardware-tools-base.md"),
         render_tool_list(BASE_TOOLS),
-    )?;
-    std::fs::write(
-        dir.join("hardware-tools-datasheet.md"),
-        render_tool_list(DATASHEET_TOOLS),
     )?;
     std::fs::write(
         dir.join("hardware-release-targets.md"),

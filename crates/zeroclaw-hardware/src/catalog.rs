@@ -10,11 +10,6 @@ pub const BASE_TOOLS: &[&str] = &[
     "device_exec",
 ];
 
-/// Datasheet lookup, loaded with the `hardware` feature. Previously gated on an
-/// Aardvark adapter being present; that adapter support was removed, and the
-/// tool is useful for any connected device.
-pub const DATASHEET_TOOLS: &[&str] = &["datasheet"];
-
 /// probe-rs backed introspection tools (in `zeroclaw-tools`).
 pub const PROBE_TOOLS: &[&str] = &[
     "hardware_board_info",
@@ -33,12 +28,7 @@ mod tests {
 
     #[test]
     fn no_duplicate_tool_names_across_sets() {
-        let mut all: Vec<&str> = BASE_TOOLS
-            .iter()
-            .chain(DATASHEET_TOOLS)
-            .chain(PROBE_TOOLS)
-            .copied()
-            .collect();
+        let mut all: Vec<&str> = BASE_TOOLS.iter().chain(PROBE_TOOLS).copied().collect();
         let before = all.len();
         all.sort_unstable();
         all.dedup();

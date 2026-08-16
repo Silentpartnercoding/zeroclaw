@@ -43,10 +43,6 @@ With the `hardware` feature, the agent gains these built-in tools:
 
 {{#include ../_snippets/hardware-tools-base.md}}
 
-With the `hardware` feature, this additional tool loads:
-
-{{#include ../_snippets/hardware-tools-datasheet.md}}
-
 All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
 ## Running on a Raspberry Pi
