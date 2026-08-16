@@ -865,9 +865,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
-        let rowan = KnowledgeTool::new(Arc::clone(&graph), scope_for("rowan"));
-        let sable = KnowledgeTool::new(graph, scope_for("sable"));
-        (tmp, rowan, sable)
+        let agent_a = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_a"));
+        let agent_b = KnowledgeTool::new(graph, scope_for("agent_b"));
+        (tmp, agent_a, agent_b)
     }
 
     #[tokio::test]
@@ -1268,27 +1268,27 @@ mod tests {
 
     #[tokio::test]
     async fn issue_repro_foreign_agent_cannot_read_captured_knowledge() {
-        let (_tmp, rowan, sable) = sibling_tools();
+        let (_tmp, agent_a, agent_b) = sibling_tools();
 
-        // Sable captures private knowledge: a client and its interactions.
+        // Agent B captures private knowledge: a client and its interactions.
         let client_id = capture_node(
-            &sable,
+            &agent_b,
             "client",
-            "Sable client",
+            "Agent B client",
             "Confidential enterprise account",
         )
         .await;
         let interaction_id = capture_node(
-            &sable,
+            &agent_b,
             "interaction",
             "Private call",
             "Confidential negotiation notes",
         )
         .await;
-        relate_nodes(&sable, &client_id, &interaction_id, "interacted_with").await;
+        relate_nodes(&agent_b, &client_id, &interaction_id, "interacted_with").await;
 
-        // Acting as rowan: search must not surface sable's nodes.
-        let result = rowan
+        // Acting as agent_a: search must not surface agent_b's nodes.
+        let result = agent_a
             .execute(json!({ "action": "search", "query": "confidential enterprise" }))
             .await
             .unwrap();
@@ -1298,7 +1298,7 @@ mod tests {
 
         // client_network / interaction_log must deny by reading as absent.
         for action in ["client_network", "interaction_log"] {
-            let result = rowan
+            let result = agent_a
                 .execute(json!({ "action": action, "client_id": client_id }))
                 .await
                 .unwrap();
@@ -1307,15 +1307,15 @@ mod tests {
         }
 
         // graph_neighbors on a foreign node reads as absent too.
-        let result = rowan
+        let result = agent_a
             .execute(json!({ "action": "graph_neighbors", "node_id": client_id }))
             .await
             .unwrap();
         assert!(!result.success);
 
         // relate onto a foreign node is refused like a missing node.
-        let own_id = capture_node(&rowan, "pattern", "Rowan note", "Own pattern").await;
-        let result = rowan
+        let own_id = capture_node(&agent_a, "pattern", "Agent A note", "Own pattern").await;
+        let result = agent_a
             .execute(json!({
                 "action": "relate",
                 "from_id": own_id,
@@ -1327,8 +1327,8 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.unwrap().contains("not found"));
 
-        // Sable's own view is unchanged by any of the above.
-        let result = sable
+        // Agent B's own view is unchanged by any of the above.
+        let result = agent_b
             .execute(json!({ "action": "client_network", "client_id": client_id }))
             .await
             .unwrap();
@@ -1339,10 +1339,10 @@ mod tests {
 
     #[tokio::test]
     async fn graph_stats_only_counts_scope_visible_rows() {
-        let (_tmp, rowan, sable) = sibling_tools();
-        capture_node(&sable, "lesson", "Sable lesson", "Private lesson").await;
+        let (_tmp, agent_a, agent_b) = sibling_tools();
+        capture_node(&agent_b, "lesson", "Agent B lesson", "Private lesson").await;
 
-        let result = rowan
+        let result = agent_a
             .execute(json!({ "action": "graph_stats" }))
             .await
             .unwrap();
@@ -1350,7 +1350,7 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["total_nodes"], 0);
 
-        let result = sable
+        let result = agent_b
             .execute(json!({ "action": "graph_stats" }))
             .await
             .unwrap();
@@ -1363,33 +1363,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
-        let sable = KnowledgeTool::new(Arc::clone(&graph), scope_for("sable"));
-        let rowan = KnowledgeTool::new(
+        let agent_b = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_b"));
+        let agent_a = KnowledgeTool::new(
             Arc::clone(&graph),
-            KnowledgeScope::for_agent("rowan", vec!["sable".to_string()]),
+            KnowledgeScope::for_agent("agent_a", vec!["agent_b".to_string()]),
         );
 
-        let sable_id =
-            capture_node(&sable, "decision", "Shared decision", "Visible to rowan").await;
+        let agent_b_id = capture_node(
+            &agent_b,
+            "decision",
+            "Shared decision",
+            "Visible to agent_a",
+        )
+        .await;
 
-        let result = rowan
+        let result = agent_a
             .execute(json!({ "action": "search", "query": "shared decision" }))
             .await
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["count"], 1);
 
-        let result = rowan
-            .execute(json!({ "action": "graph_neighbors", "node_id": sable_id }))
+        let result = agent_a
+            .execute(json!({ "action": "graph_neighbors", "node_id": agent_b_id }))
             .await
             .unwrap();
         assert!(result.success, "allowlisted sibling nodes must be readable");
 
-        // Rowan's capture is still attributed to rowan: sable (with no
+        // Agent A's capture is still attributed to agent_a: agent_b (with no
         // reciprocal grant) does not see it.
-        capture_node(&rowan, "pattern", "Rowan pattern", "Rowan private").await;
-        let result = sable
-            .execute(json!({ "action": "search", "query": "rowan private" }))
+        capture_node(&agent_a, "pattern", "Agent A pattern", "Agent A private").await;
+        let result = agent_b
+            .execute(json!({ "action": "search", "query": "agent_a private" }))
             .await
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
@@ -1412,10 +1417,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let rowan = KnowledgeTool::new(Arc::clone(&graph), scope_for("rowan"));
-        let sable = KnowledgeTool::new(Arc::clone(&graph), scope_for("sable"));
+        let agent_a = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_a"));
+        let agent_b = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_b"));
 
-        for tool in [&rowan, &sable] {
+        for tool in [&agent_a, &agent_b] {
             let result = tool
                 .execute(json!({ "action": "search", "query": "legacy pattern" }))
                 .await
@@ -1424,14 +1429,14 @@ mod tests {
             assert_eq!(output["count"], 0, "unowned legacy rows fail closed");
         }
 
-        graph.prepare_legacy_ownership(Some("rowan")).unwrap();
-        let result = rowan
+        graph.prepare_legacy_ownership(Some("agent_a")).unwrap();
+        let result = agent_a
             .execute(json!({ "action": "search", "query": "legacy pattern" }))
             .await
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["count"], 1);
-        let result = sable
+        let result = agent_b
             .execute(json!({ "action": "search", "query": "legacy pattern" }))
             .await
             .unwrap();

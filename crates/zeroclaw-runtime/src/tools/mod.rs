@@ -2477,18 +2477,18 @@ mod tests {
             .unwrap();
         drop(legacy_graph);
         cfg.agents
-            .insert("rowan".to_string(), AliasedAgentConfig::default());
+            .insert("agent_a".to_string(), AliasedAgentConfig::default());
         cfg.agents
-            .insert("sable".to_string(), AliasedAgentConfig::default());
-        // Carol is granted read access to rowan's knowledge rows.
-        let mut carol = AliasedAgentConfig::default();
-        carol
+            .insert("agent_b".to_string(), AliasedAgentConfig::default());
+        // Agent C is granted read access to agent_a's knowledge rows.
+        let mut agent_c = AliasedAgentConfig::default();
+        agent_c
             .workspace
             .read_knowledge_from
-            .push(zeroclaw_config::multi_agent::AgentAlias::new("rowan"));
-        cfg.agents.insert("carol".to_string(), carol);
+            .push(zeroclaw_config::multi_agent::AgentAlias::new("agent_a"));
+        cfg.agents.insert("agent_c".to_string(), agent_c);
         cfg.knowledge.legacy_owner_agent =
-            Some(zeroclaw_config::multi_agent::AgentAlias::new("rowan"));
+            Some(zeroclaw_config::multi_agent::AgentAlias::new("agent_a"));
 
         let knowledge_tool_for = |alias: &str| {
             let tools = all_tools(
@@ -2517,15 +2517,15 @@ mod tests {
                 .expect("knowledge tool must register when knowledge.enabled")
         };
 
-        let rowan_tool = knowledge_tool_for("rowan");
-        let sable_tool = knowledge_tool_for("sable");
-        let carol_tool = knowledge_tool_for("carol");
+        let agent_a_tool = knowledge_tool_for("agent_a");
+        let agent_b_tool = knowledge_tool_for("agent_b");
+        let agent_c_tool = knowledge_tool_for("agent_c");
 
-        let captured = rowan_tool
+        let captured = agent_a_tool
             .execute(serde_json::json!({
                 "action": "capture",
                 "node_type": "pattern",
-                "title": "Rowan pattern",
+                "title": "Agent A pattern",
                 "content": "Registration scoping proof"
             }))
             .await
@@ -2546,22 +2546,22 @@ mod tests {
         }
 
         assert_eq!(
-            search_count(rowan_tool.as_ref()).await,
+            search_count(agent_a_tool.as_ref()).await,
             1,
             "the capturing agent sees its own row"
         );
         assert_eq!(
-            search_count(sable_tool.as_ref()).await,
+            search_count(agent_b_tool.as_ref()).await,
             0,
             "a sibling with no grant must not see another agent's rows"
         );
         assert_eq!(
-            search_count(carol_tool.as_ref()).await,
+            search_count(agent_c_tool.as_ref()).await,
             1,
             "workspace.read_knowledge_from must widen reads through registration"
         );
 
-        let legacy_search = rowan_tool
+        let legacy_search = agent_a_tool
             .execute(serde_json::json!({
                 "action": "search",
                 "query": "explicit ownership proof"
@@ -2570,7 +2570,7 @@ mod tests {
             .unwrap();
         let legacy_output: serde_json::Value = serde_json::from_str(&legacy_search.output).unwrap();
         assert_eq!(legacy_output["count"], 1);
-        let legacy_search = sable_tool
+        let legacy_search = agent_b_tool
             .execute(serde_json::json!({
                 "action": "search",
                 "query": "explicit ownership proof"
@@ -2603,9 +2603,9 @@ mod tests {
             .to_string_lossy()
             .to_string();
         cfg.agents
-            .insert("rowan".to_string(), AliasedAgentConfig::default());
+            .insert("agent_a".to_string(), AliasedAgentConfig::default());
         cfg.agents
-            .insert("sable".to_string(), AliasedAgentConfig::default());
+            .insert("agent_b".to_string(), AliasedAgentConfig::default());
         let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &cfg.knowledge.resolved_db_path(),
             cfg.knowledge.max_nodes,
@@ -2627,7 +2627,7 @@ mod tests {
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "rowan",
+            "agent_a",
             mem,
             None,
             None,
@@ -2672,7 +2672,7 @@ mod tests {
             .to_string();
         cfg.agents.clear();
         cfg.agents
-            .insert("rowan".to_string(), AliasedAgentConfig::default());
+            .insert("agent_a".to_string(), AliasedAgentConfig::default());
         let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &cfg.knowledge.resolved_db_path(),
             cfg.knowledge.max_nodes,
@@ -2694,7 +2694,7 @@ mod tests {
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "rowan",
+            "agent_a",
             mem,
             None,
             None,

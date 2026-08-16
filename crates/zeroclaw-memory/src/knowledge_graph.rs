@@ -1772,14 +1772,14 @@ mod tests {
 
     #[test]
     fn foreign_nodes_are_invisible_across_every_read_path() {
-        let (_tmp, graph, rowan) = test_graph();
-        let sable = agent("sable");
+        let (_tmp, graph, agent_a) = test_graph();
+        let agent_b = agent("agent_b");
 
         let secret = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Client,
-                "Sable client",
+                "Agent B client",
                 "confidential client roster",
                 &["confidential".into()],
                 None,
@@ -1787,44 +1787,49 @@ mod tests {
             .unwrap();
         let note = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Interaction,
-                "Sable call",
+                "Agent B call",
                 "confidential call notes",
                 &["confidential".into()],
                 None,
             )
             .unwrap();
         graph
-            .add_edge(&sable, &secret, &note, Relation::InteractedWith)
+            .add_edge(&agent_b, &secret, &note, Relation::InteractedWith)
             .unwrap();
 
-        assert!(graph.get_node(&rowan, &secret).unwrap().is_none());
+        assert!(graph.get_node(&agent_a, &secret).unwrap().is_none());
         assert!(
             graph
-                .query_by_tags(&rowan, &["confidential".into()])
+                .query_by_tags(&agent_a, &["confidential".into()])
                 .unwrap()
                 .is_empty()
         );
         assert!(
             graph
-                .query_by_similarity(&rowan, "confidential", 10)
+                .query_by_similarity(&agent_a, "confidential", 10)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             graph
-                .query_by_type(&rowan, NodeType::Client, 10)
+                .query_by_type(&agent_a, NodeType::Client, 10)
                 .unwrap()
                 .is_empty()
         );
-        assert!(graph.find_related(&rowan, &secret).unwrap().is_empty());
-        assert!(graph.find_outbound(&rowan, &secret, 10).unwrap().is_empty());
-        assert!(graph.find_inbound(&rowan, &note, 10).unwrap().is_empty());
+        assert!(graph.find_related(&agent_a, &secret).unwrap().is_empty());
+        assert!(
+            graph
+                .find_outbound(&agent_a, &secret, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(graph.find_inbound(&agent_a, &note, 10).unwrap().is_empty());
         assert!(
             graph
                 .find_outbound_by_relation_and_type(
-                    &rowan,
+                    &agent_a,
                     &secret,
                     Relation::InteractedWith,
                     NodeType::Interaction,
@@ -1833,31 +1838,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let (nodes, edges) = graph.get_subgraph(&rowan, &secret, 3).unwrap();
+        let (nodes, edges) = graph.get_subgraph(&agent_a, &secret, 3).unwrap();
         assert!(nodes.is_empty());
         assert!(edges.is_empty());
 
-        let stats = graph.stats(&rowan).unwrap();
+        let stats = graph.stats(&agent_a).unwrap();
         assert_eq!(stats.total_nodes, 0);
         assert_eq!(stats.total_edges, 0);
         assert!(stats.top_tags.is_empty());
 
         // The owning scope still sees everything.
-        assert!(graph.get_node(&sable, &secret).unwrap().is_some());
-        assert_eq!(graph.stats(&sable).unwrap().total_nodes, 2);
+        assert!(graph.get_node(&agent_b, &secret).unwrap().is_some());
+        assert_eq!(graph.stats(&agent_b).unwrap().total_nodes, 2);
     }
 
     #[test]
     fn relate_refuses_foreign_endpoints_without_leaking_existence() {
-        let (_tmp, graph, rowan) = test_graph();
-        let sable = agent("sable");
+        let (_tmp, graph, agent_a) = test_graph();
+        let agent_b = agent("agent_b");
 
         let own = graph
-            .add_node(&rowan, NodeType::Pattern, "Mine", "Own node", &[], None)
+            .add_node(&agent_a, NodeType::Pattern, "Mine", "Own node", &[], None)
             .unwrap();
         let foreign = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Pattern,
                 "Theirs",
                 "Foreign node",
@@ -1867,7 +1872,7 @@ mod tests {
             .unwrap();
 
         let err = graph
-            .add_edge(&rowan, &own, &foreign, Relation::Uses)
+            .add_edge(&agent_a, &own, &foreign, Relation::Uses)
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1875,7 +1880,7 @@ mod tests {
             "foreign endpoints must read exactly like missing ones"
         );
         let err = graph
-            .add_edge(&rowan, &foreign, &own, Relation::Uses)
+            .add_edge(&agent_a, &foreign, &own, Relation::Uses)
             .unwrap_err();
         assert_eq!(err.to_string(), format!("source node not found: {foreign}"));
     }
@@ -1883,8 +1888,8 @@ mod tests {
     #[test]
     fn legacy_rows_fail_closed_until_assigned_to_one_agent() {
         let (_tmp, graph, _unused) = test_graph();
-        let rowan = agent("rowan");
-        let sable = agent("sable");
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
         let admin = KnowledgeScope::unrestricted();
 
         // Unrestricted writes model unattributed pre-upgrade rows.
@@ -1912,7 +1917,7 @@ mod tests {
         graph
             .add_edge(&admin, &shared_a, &shared_b, Relation::Uses)
             .unwrap();
-        for scope in [&rowan, &sable] {
+        for scope in [&agent_a, &agent_b] {
             assert!(graph.get_node(scope, &shared_a).unwrap().is_none());
             assert!(
                 graph
@@ -1924,20 +1929,26 @@ mod tests {
         let err = graph.prepare_legacy_ownership(None).unwrap_err();
         assert!(err.to_string().contains("legacy_owner_agent"));
 
-        assert_eq!(graph.prepare_legacy_ownership(Some("rowan")).unwrap(), 3);
-        let node = graph.get_node(&rowan, &shared_a).unwrap().unwrap();
-        assert_eq!(node.owner_agent.as_deref(), Some("rowan"));
-        assert!(graph.get_node(&sable, &shared_a).unwrap().is_none());
-        assert_eq!(graph.find_outbound(&rowan, &shared_a, 10).unwrap().len(), 1);
+        assert_eq!(graph.prepare_legacy_ownership(Some("agent_a")).unwrap(), 3);
+        let node = graph.get_node(&agent_a, &shared_a).unwrap().unwrap();
+        assert_eq!(node.owner_agent.as_deref(), Some("agent_a"));
+        assert!(graph.get_node(&agent_b, &shared_a).unwrap().is_none());
+        assert_eq!(
+            graph.find_outbound(&agent_a, &shared_a, 10).unwrap().len(),
+            1
+        );
 
         // The assigned graph behaves like any other private agent state.
         graph
-            .add_edge(&rowan, &shared_a, &shared_b, Relation::Uses)
+            .add_edge(&agent_a, &shared_a, &shared_b, Relation::Uses)
             .unwrap();
-        assert_eq!(graph.find_outbound(&rowan, &shared_a, 10).unwrap().len(), 1);
+        assert_eq!(
+            graph.find_outbound(&agent_a, &shared_a, 10).unwrap().len(),
+            1
+        );
         assert!(
             graph
-                .find_outbound(&sable, &shared_a, 10)
+                .find_outbound(&agent_b, &shared_a, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1946,65 +1957,65 @@ mod tests {
     #[test]
     fn read_allowlist_widens_reads_but_not_writes() {
         let (_tmp, graph, _unused) = test_graph();
-        let sable = agent("sable");
-        let rowan = agent_reading_from("rowan", &["sable"]);
+        let agent_b = agent("agent_b");
+        let agent_a = agent_reading_from("agent_a", &["agent_b"]);
 
-        let sable_node = graph
+        let agent_b_node = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Decision,
-                "Sable decision",
-                "shared with rowan",
+                "Agent B decision",
+                "shared with agent_a",
                 &["ops".into()],
                 None,
             )
             .unwrap();
 
         // Reads widen to the allowlisted sibling.
-        assert!(graph.get_node(&rowan, &sable_node).unwrap().is_some());
+        assert!(graph.get_node(&agent_a, &agent_b_node).unwrap().is_some());
         assert_eq!(
             graph
-                .query_by_similarity(&rowan, "shared rowan", 10)
+                .query_by_similarity(&agent_a, "shared agent_a", 10)
                 .unwrap()
                 .len(),
             1
         );
 
         // Writes still stamp the caller, never the sibling.
-        let rowan_node = graph
+        let agent_a_node = graph
             .add_node(
-                &rowan,
+                &agent_a,
                 NodeType::Pattern,
-                "Rowan note",
+                "Agent A note",
                 "annotation",
                 &[],
                 None,
             )
             .unwrap();
-        let stored = graph.get_node(&rowan, &rowan_node).unwrap().unwrap();
-        assert_eq!(stored.owner_agent.as_deref(), Some("rowan"));
+        let stored = graph.get_node(&agent_a, &agent_a_node).unwrap().unwrap();
+        assert_eq!(stored.owner_agent.as_deref(), Some("agent_a"));
 
-        // Rowan may annotate the shared node; sable does not see the
+        // Agent A may annotate the shared node; agent_b does not see the
         // annotation edge and the allowlist is directional.
         graph
-            .add_edge(&rowan, &rowan_node, &sable_node, Relation::AppliesTo)
+            .add_edge(&agent_a, &agent_a_node, &agent_b_node, Relation::AppliesTo)
             .unwrap();
         assert!(
             graph
-                .find_inbound(&sable, &sable_node, 10)
+                .find_inbound(&agent_b, &agent_b_node, 10)
                 .unwrap()
                 .is_empty()
         );
-        assert!(graph.get_node(&sable, &rowan_node).unwrap().is_none());
+        assert!(graph.get_node(&agent_b, &agent_a_node).unwrap().is_none());
     }
 
     #[test]
     fn duplicate_edges_across_scopes_collapse_for_joint_readers() {
         let (_tmp, graph, _unused) = test_graph();
         let seed = agent("seed");
-        let rowan = agent_reading_from("rowan", &["seed"]);
-        let sable = agent_reading_from("sable", &["seed"]);
-        let carol = agent_reading_from("carol", &["seed", "rowan", "sable"]);
+        let agent_a = agent_reading_from("agent_a", &["seed"]);
+        let agent_b = agent_reading_from("agent_b", &["seed"]);
+        let agent_c = agent_reading_from("agent_c", &["seed", "agent_a", "agent_b"]);
 
         let a = graph
             .add_node(&seed, NodeType::Pattern, "Seed A", "shared", &[], None)
@@ -2013,84 +2024,91 @@ mod tests {
             .add_node(&seed, NodeType::Technology, "Seed B", "shared", &[], None)
             .unwrap();
 
-        // Rowan and sable independently record the same relation; each
+        // Agent A and agent_b independently record the same relation; each
         // write is invisible to the other, so both rows exist.
-        graph.add_edge(&rowan, &a, &b, Relation::Uses).unwrap();
-        graph.add_edge(&sable, &a, &b, Relation::Uses).unwrap();
+        graph.add_edge(&agent_a, &a, &b, Relation::Uses).unwrap();
+        graph.add_edge(&agent_b, &a, &b, Relation::Uses).unwrap();
 
         // A reader who sees both scopes gets the relation once.
-        let neighbors = graph.find_outbound(&carol, &a, 10).unwrap();
+        let neighbors = graph.find_outbound(&agent_c, &a, 10).unwrap();
         assert_eq!(neighbors.len(), 1);
-        let related = graph.find_related(&carol, &a).unwrap();
+        let related = graph.find_related(&agent_c, &a).unwrap();
         assert_eq!(related.len(), 1);
-        let (_, edges) = graph.get_subgraph(&carol, &a, 1).unwrap();
+        let (_, edges) = graph.get_subgraph(&agent_c, &a, 1).unwrap();
         assert_eq!(edges.len(), 1);
-        assert_eq!(graph.stats(&carol).unwrap().total_edges, 1);
+        assert_eq!(graph.stats(&agent_c).unwrap().total_edges, 1);
 
         // Re-adding an edge the caller can already see stays a no-op.
-        graph.add_edge(&rowan, &a, &b, Relation::Uses).unwrap();
-        assert_eq!(graph.find_outbound(&rowan, &a, 10).unwrap().len(), 1);
+        graph.add_edge(&agent_a, &a, &b, Relation::Uses).unwrap();
+        assert_eq!(graph.find_outbound(&agent_a, &a, 10).unwrap().len(), 1);
     }
 
     #[test]
     fn subgraph_traversal_does_not_bridge_through_foreign_regions() {
         let (_tmp, graph, _unused) = test_graph();
         let seed = agent("seed");
-        let rowan = agent_reading_from("rowan", &["seed"]);
-        let sable = agent_reading_from("sable", &["seed"]);
+        let agent_a = agent_reading_from("agent_a", &["seed"]);
+        let agent_b = agent_reading_from("agent_b", &["seed"]);
 
-        // Layout: rowan_node -> shared (rowan's edge), and sable's own
-        // chain shared -> sable_private (sable's edge).
-        let rowan_node = graph
-            .add_node(&rowan, NodeType::Pattern, "Rowan node", "mine", &[], None)
+        // Layout: agent_a_node -> shared (agent_a's edge), and agent_b's own
+        // chain shared -> agent_b_private (agent_b's edge).
+        let agent_a_node = graph
+            .add_node(
+                &agent_a,
+                NodeType::Pattern,
+                "Agent A node",
+                "mine",
+                &[],
+                None,
+            )
             .unwrap();
         let shared = graph
             .add_node(&seed, NodeType::Technology, "Shared", "shared", &[], None)
             .unwrap();
-        let sable_private = graph
+        let agent_b_private = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Client,
-                "Sable client",
+                "Agent B client",
                 "private",
                 &[],
                 None,
             )
             .unwrap();
         graph
-            .add_edge(&rowan, &rowan_node, &shared, Relation::Uses)
+            .add_edge(&agent_a, &agent_a_node, &shared, Relation::Uses)
             .unwrap();
         graph
-            .add_edge(&sable, &shared, &sable_private, Relation::AppliesTo)
+            .add_edge(&agent_b, &shared, &agent_b_private, Relation::AppliesTo)
             .unwrap();
 
-        let (nodes, edges) = graph.get_subgraph(&rowan, &rowan_node, 5).unwrap();
+        let (nodes, edges) = graph.get_subgraph(&agent_a, &agent_a_node, 5).unwrap();
         let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&rowan_node.as_str()));
+        assert!(ids.contains(&agent_a_node.as_str()));
         assert!(ids.contains(&shared.as_str()));
         assert!(
-            !ids.contains(&sable_private.as_str()),
+            !ids.contains(&agent_b_private.as_str()),
             "traversal must not cross into another agent's region"
         );
         assert_eq!(edges.len(), 1);
 
-        // Sable's walk from the shared node sees only sable's region.
-        let (nodes, _) = graph.get_subgraph(&sable, &shared, 5).unwrap();
+        // Agent B's walk from the shared node sees only agent_b's region.
+        let (nodes, _) = graph.get_subgraph(&agent_b, &shared, 5).unwrap();
         let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&sable_private.as_str()));
-        assert!(!ids.contains(&rowan_node.as_str()));
+        assert!(ids.contains(&agent_b_private.as_str()));
+        assert!(!ids.contains(&agent_a_node.as_str()));
     }
 
     #[test]
     fn experts_from_foreign_scopes_stay_hidden() {
-        let (_tmp, graph, rowan) = test_graph();
-        let sable = agent("sable");
+        let (_tmp, graph, agent_a) = test_graph();
+        let agent_b = agent("agent_b");
 
         let expert = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Expert,
-                "Sable expert",
+                "Agent B expert",
                 "expert",
                 &[],
                 None,
@@ -2098,27 +2116,27 @@ mod tests {
             .unwrap();
         let pattern = graph
             .add_node(
-                &sable,
+                &agent_b,
                 NodeType::Pattern,
-                "Sable pattern",
+                "Agent B pattern",
                 "pattern",
                 &["caching".into()],
                 None,
             )
             .unwrap();
         graph
-            .add_edge(&sable, &pattern, &expert, Relation::AuthoredBy)
+            .add_edge(&agent_b, &pattern, &expert, Relation::AuthoredBy)
             .unwrap();
 
         assert!(
             graph
-                .find_experts(&rowan, &["caching".into()])
+                .find_experts(&agent_a, &["caching".into()])
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
             graph
-                .find_experts(&sable, &["caching".into()])
+                .find_experts(&agent_b, &["caching".into()])
                 .unwrap()
                 .len(),
             1
@@ -2127,15 +2145,15 @@ mod tests {
 
     #[test]
     fn unrestricted_scope_sees_every_row() {
-        let (_tmp, graph, rowan) = test_graph();
-        let sable = agent("sable");
+        let (_tmp, graph, agent_a) = test_graph();
+        let agent_b = agent("agent_b");
         let admin = KnowledgeScope::unrestricted();
 
         graph
-            .add_node(&rowan, NodeType::Pattern, "R", "rowan row", &[], None)
+            .add_node(&agent_a, NodeType::Pattern, "R", "agent_a row", &[], None)
             .unwrap();
         graph
-            .add_node(&sable, NodeType::Pattern, "S", "sable row", &[], None)
+            .add_node(&agent_b, NodeType::Pattern, "S", "agent_b row", &[], None)
             .unwrap();
 
         let stats = graph.stats(&admin).unwrap();
@@ -2212,50 +2230,50 @@ mod tests {
         let (id_a, id_b) = legacy_database(&db_path);
 
         let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
-        let rowan = agent("rowan");
+        let agent_a = agent("agent_a");
 
-        assert!(graph.get_node(&rowan, &id_a).unwrap().is_none());
+        assert!(graph.get_node(&agent_a, &id_a).unwrap().is_none());
         assert!(graph.prepare_legacy_ownership(None).is_err());
-        assert_eq!(graph.prepare_legacy_ownership(Some("rowan")).unwrap(), 3);
+        assert_eq!(graph.prepare_legacy_ownership(Some("agent_a")).unwrap(), 3);
 
         // Legacy nodes and their edge survive and belong only to the selected
         // owner. FTS remains intact after attribution.
-        let node = graph.get_node(&rowan, &id_a).unwrap().unwrap();
-        assert_eq!(node.owner_agent.as_deref(), Some("rowan"));
+        let node = graph.get_node(&agent_a, &id_a).unwrap().unwrap();
+        assert_eq!(node.owner_agent.as_deref(), Some("agent_a"));
         assert_eq!(node.title, "Legacy pattern");
-        let neighbors = graph.find_outbound(&rowan, &id_a, 10).unwrap();
+        let neighbors = graph.find_outbound(&agent_a, &id_a, 10).unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].0.id, id_b);
 
         assert!(
             !graph
-                .query_by_similarity(&rowan, "legacy content", 10)
+                .query_by_similarity(&agent_a, "legacy content", 10)
                 .unwrap()
                 .is_empty()
         );
 
         // New writes are attributed.
         let new_id = graph
-            .add_node(&rowan, NodeType::Lesson, "New", "new row", &[], None)
+            .add_node(&agent_a, NodeType::Lesson, "New", "new row", &[], None)
             .unwrap();
         assert_eq!(
             graph
-                .get_node(&rowan, &new_id)
+                .get_node(&agent_a, &new_id)
                 .unwrap()
                 .unwrap()
                 .owner_agent
                 .as_deref(),
-            Some("rowan")
+            Some("agent_a")
         );
         drop(graph);
 
         // Reopening (running the migration path again) changes nothing.
         let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
         assert_eq!(graph.prepare_legacy_ownership(None).unwrap(), 0);
-        let stats = graph.stats(&agent("sable")).unwrap();
+        let stats = graph.stats(&agent("agent_b")).unwrap();
         assert_eq!(stats.total_nodes, 0);
         assert_eq!(stats.total_edges, 0);
-        assert_eq!(graph.stats(&rowan).unwrap().total_nodes, 3);
+        assert_eq!(graph.stats(&agent_a).unwrap().total_nodes, 3);
     }
 
     #[test]
@@ -2288,20 +2306,20 @@ mod tests {
     #[test]
     fn rename_and_delete_follow_durable_owner_lifecycle() {
         let (_tmp, graph, _unused) = test_graph();
-        let rowan = agent("rowan");
+        let agent_a = agent("agent_a");
         let a = graph
-            .add_node(&rowan, NodeType::Pattern, "A", "owned", &[], None)
+            .add_node(&agent_a, NodeType::Pattern, "A", "owned", &[], None)
             .unwrap();
         let b = graph
-            .add_node(&rowan, NodeType::Technology, "B", "owned", &[], None)
+            .add_node(&agent_a, NodeType::Technology, "B", "owned", &[], None)
             .unwrap();
-        graph.add_edge(&rowan, &a, &b, Relation::Uses).unwrap();
+        graph.add_edge(&agent_a, &a, &b, Relation::Uses).unwrap();
 
-        assert_eq!(graph.rename_owner("rowan", "renamed").unwrap(), 3);
-        assert_eq!(graph.count_owner("rowan").unwrap(), 0);
+        assert_eq!(graph.rename_owner("agent_a", "renamed").unwrap(), 3);
+        assert_eq!(graph.count_owner("agent_a").unwrap(), 0);
         assert_eq!(graph.count_owner("renamed").unwrap(), 3);
         assert!(graph.get_node(&agent("renamed"), &a).unwrap().is_some());
-        assert!(graph.get_node(&rowan, &a).unwrap().is_none());
+        assert!(graph.get_node(&agent_a, &a).unwrap().is_none());
 
         let export = graph.export_owner("renamed").unwrap();
         assert_eq!(export["nodes"].as_array().unwrap().len(), 2);
@@ -2372,16 +2390,16 @@ mod tests {
         // the second open must find the migration already applied.
         let graph_a = KnowledgeGraph::new(&db_path, 1000).unwrap();
         let graph_b = KnowledgeGraph::new(&db_path, 1000).unwrap();
-        let rowan = agent("rowan");
-        let sable = agent("sable");
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
 
-        let rowan_id = graph_a
-            .add_node(&rowan, NodeType::Pattern, "Rowan", "mine", &[], None)
+        let agent_a_id = graph_a
+            .add_node(&agent_a, NodeType::Pattern, "Agent A", "mine", &[], None)
             .unwrap();
         assert!(
-            graph_b.get_node(&sable, &rowan_id).unwrap().is_none(),
+            graph_b.get_node(&agent_b, &agent_a_id).unwrap().is_none(),
             "attribution must hold across separate connections to one file"
         );
-        assert!(graph_b.get_node(&rowan, &rowan_id).unwrap().is_some());
+        assert!(graph_b.get_node(&agent_a, &agent_a_id).unwrap().is_some());
     }
 }

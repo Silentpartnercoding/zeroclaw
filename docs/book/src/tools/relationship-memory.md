@@ -25,11 +25,11 @@ The store is one install-wide database, but entries are attributed per agent. Ev
 - rows owned by agents the operator explicitly shares via the workspace allowlist:
 
 ```toml
-[agents.rowan.workspace]
-read_knowledge_from = ["sable"]
+[agents.agent_a.workspace]
+read_knowledge_from = ["agent_b"]
 ```
 
-The grant is directional and read-only: `rowan` can read (and privately annotate) `sable`'s entries, while `sable` learns nothing about `rowan`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors.
+The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors.
 
 ### Assign pre-attribution rows during upgrade
 
@@ -43,7 +43,7 @@ agent-scoped tool until startup assigns them to one agent:
 ```toml
 [knowledge]
 enabled = true
-legacy_owner_agent = "rowan"
+legacy_owner_agent = "agent_a"
 ```
 
 The assignment is transactional and idempotent. After it succeeds, the rows obey
