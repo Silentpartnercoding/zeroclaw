@@ -6,7 +6,9 @@ use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::{Context, Result};
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -23,6 +25,7 @@ pub(crate) async fn finish_after_max_iterations(
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
+    event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
@@ -179,14 +182,22 @@ pub(crate) async fn finish_after_max_iterations(
         out.push(summary_msg.clone());
     }
     history.push(summary_msg);
-    accumulated_display_text.push_str(&text);
     // Graceful shutdown with a visible reason so the user knows why the
     // agent stopped making progress.
-    accumulated_display_text.push_str("\n\n");
-    accumulated_display_text.push_str(&crate::i18n::get_required_cli_string_with_args(
+    let stop_reason = crate::i18n::get_required_cli_string_with_args(
         "turn-max-iterations-reached",
         &[("max_iterations", &max_iterations.to_string())],
-    ));
+    );
+    let segment = format!("{text}\n\n{stop_reason}");
+    // This summary is the turn's only visible output on the max-iteration
+    // exit path, and it comes from a fresh non-streaming call — there is no
+    // live delta a client could have already received, so unlike the normal
+    // final-response path this emit needs no live-vs-post-hoc guard. Only the
+    // newly-produced segment goes out; `accumulated_display_text` holds
+    // narration earlier iterations already streamed, and resending it here
+    // would duplicate it in the client.
+    super::events::emit_posthoc_turn_chunk(event_tx, &segment).await;
+    accumulated_display_text.push_str(&segment);
     Ok(accumulated_display_text)
 }
 
@@ -206,6 +217,8 @@ mod graceful_summary_metering_tests {
     use zeroclaw_config::schema::{CostConfig, PacingConfig};
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    use super::{Sender, TurnEvent};
 
     /// Provider stub that counts calls and returns a summary WITH token usage.
     struct CountingUsageProvider {
@@ -253,7 +266,11 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
+    async fn run_summary_with_events(
+        provider: &dyn ModelProvider,
+        accumulated_display_text: String,
+        event_tx: Option<&Sender<TurnEvent>>,
+    ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
@@ -266,12 +283,17 @@ mod graceful_summary_metering_tests {
             &pacing,
             None,
             2,
-            String::new(),
+            accumulated_display_text,
             "trace-req-test",
             &knobs,
+            event_tx,
             None,
         )
         .await
+    }
+
+    async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
+        run_summary_with_events(provider, String::new(), None).await
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -500,6 +522,7 @@ mod graceful_summary_metering_tests {
             "trace-req-audio",
             &knobs,
             None,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -513,6 +536,46 @@ mod graceful_summary_metering_tests {
         assert!(
             captured.contains("[media attachment]"),
             "audio marker should be replaced with a placeholder: {captured}"
+        );
+    }
+
+    // ACP and other event-driven clients render message content exclusively
+    // from `TurnEvent::Chunk`. The max-iteration exit must emit one, and it
+    // must carry only the newly-produced segment — narration from earlier
+    // iterations already reached the client through prior chunks, so
+    // re-sending `accumulated_display_text` here would duplicate it.
+    #[tokio::test]
+    async fn graceful_summary_emits_a_turn_event_chunk_with_only_the_new_segment() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+
+        let out = run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+
+        let mut chunk_delta = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                chunk_delta = Some(delta);
+            }
+        }
+        let delta = chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk");
+        assert!(
+            delta.contains("wrap-up summary"),
+            "chunk must carry the summary text: {delta}"
+        );
+        assert!(
+            delta.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "chunk must carry the max-iterations stop reason: {delta}"
+        );
+        assert!(
+            !delta.contains("earlier narration"),
+            "chunk must not re-send narration already streamed in earlier iterations: {delta}"
         );
     }
 }
