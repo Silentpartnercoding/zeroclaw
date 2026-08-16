@@ -611,7 +611,7 @@ impl ModelRoutingConfigTool {
             .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
         if let Some(model_name) = current_model
-            && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
+            && let Err(probe_err) = self.probe_model(&cfg, &provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
                 let reverted_model = previous_provider_entry
@@ -651,30 +651,88 @@ impl ModelRoutingConfigTool {
         })
     }
 
+    /// `cfg` was just loaded via `load_config_without_env`, which parses the
+    /// on-disk TOML as-is and never decrypts `#[secret]` fields — so any
+    /// persisted API key is still `enc2:`-ciphertext at this point, exactly
+    /// as `save()` last wrote it. Build a private, decrypted working copy for
+    /// the probe to read credentials from; the caller's `cfg` (and what
+    /// ultimately reaches disk) is untouched.
+    fn decrypt_for_probe(cfg: &Config) -> anyhow::Result<Config> {
+        let mut decrypted = cfg.clone();
+        let zeroclaw_dir = decrypted
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| decrypted.config_path.clone());
+        let store =
+            zeroclaw_config::security::SecretStore::new(&zeroclaw_dir, decrypted.secrets.encrypt);
+        decrypted.decrypt_secrets(&store)?;
+        Ok(decrypted)
+    }
+
     /// Send a minimal 1-token chat request to verify the model is accessible.
-    /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
-    /// (the probe would fail with an auth error unrelated to model validity).
-    /// ModelProvider construction failures are also treated as non-fatal.
-    async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
-        // Use the runtime config's API key (which includes env-sourced keys),
-        // not the on-disk config (which may have no key at all).
+    /// Returns `Ok(())` if the probe succeeds **or** if no API key is configured
+    /// on the saved alias (checking the runtime snapshot too — see below), or
+    /// the saved config's secrets cannot be decrypted (either way the probe
+    /// would fail with an auth error unrelated to model validity, and an
+    /// operator may be configuring the alias while offline). A failure to
+    /// construct the model_provider is surfaced as an `Err` like any other
+    /// probe failure, rather than treated as a passing probe.
+    async fn probe_model(
+        &self,
+        cfg: &Config,
+        provider_name: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        // Resolve alias identity, endpoint, and auth options from the config
+        // that was just saved, not the pre-update runtime snapshot, so the
+        // probe validates what is actually on disk.
+        let Ok(mut decrypted) = Self::decrypt_for_probe(cfg) else {
+            return Ok(());
+        };
         let (family, alias) = provider_name
             .split_once('.')
             .unwrap_or((provider_name, "default"));
-        let entry = self.config.providers.models.find(family, alias);
-        let api_key = entry.and_then(|e| e.api_key.as_deref());
-        if api_key.is_none_or(|k| k.trim().is_empty()) {
+
+        // The credential itself needs a wider net: `load_config_without_env`
+        // (the source of `cfg`) never applies `ZEROCLAW_*` env-var bridges,
+        // so an alias whose key comes purely from the environment - the
+        // common posture in containers and CI - has no key in the saved
+        // config even though it works fine at real request time. Prefer the
+        // just-saved key when present (an operator who wrote a new key must
+        // be probed against the new one, not a stale env-sourced one), but
+        // fall back to `self.config` - the runtime snapshot, which already
+        // went through `load_or_init`'s decrypt + env-override pass, so it
+        // is used as-is and never re-decrypted here.
+        let saved_key = decrypted
+            .providers
+            .models
+            .find(family, alias)
+            .and_then(|e| e.api_key.clone())
+            .filter(|key| !key.trim().is_empty());
+        let api_key = match saved_key {
+            Some(key) => Some(key),
+            None => self
+                .config
+                .providers
+                .models
+                .find(family, alias)
+                .and_then(|e| e.api_key.clone())
+                .filter(|key| !key.trim().is_empty()),
+        };
+        let Some(api_key) = api_key else {
             return Ok(());
+        };
+
+        // Carry the resolved key on the config handed to the factory so
+        // alias-specific credentials resolve correctly regardless of which
+        // config they came from.
+        if let Some(entry) = decrypted.providers.models.ensure(family, alias) {
+            entry.api_key = Some(api_key);
         }
 
-        let model_provider = match zeroclaw_providers::create_model_provider_with_url(
-            provider_name,
-            api_key,
-            entry.and_then(|e| e.uri.as_deref()),
-        ) {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
+        let model_provider =
+            zeroclaw_providers::create_model_provider_from_ref(&decrypted, provider_name)?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -1482,5 +1540,131 @@ mod tests {
         let entry = read_saved_provider_entry(&cfg_path, "custom", "default")
             .expect("temperature-only set_default must create the custom.default placeholder slot");
         assert_eq!(entry.temperature, Some(1.5));
+    }
+
+    #[tokio::test]
+    async fn probe_model_uses_saved_alias_config_not_stale_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let stale_snapshot = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(stale_snapshot.clone(), test_security());
+
+        // The tool's own construction-time snapshot has no credentials for
+        // this alias at all, so probing directly against it is a legitimate
+        // skip (no API key means nothing to validate).
+        let against_stale = tool
+            .probe_model(stale_snapshot.as_ref(), "openai.default", "gpt-test")
+            .await;
+        assert!(against_stale.is_ok(), "{against_stale:?}");
+
+        // A config that has since been saved carries a credential the stale
+        // snapshot never had (mismatched on purpose, so construction fails
+        // locally rather than reaching the network). Both configs offer the
+        // same alias, so this exercises alias resolution, not the runtime
+        // credential fallback: the probe must resolve from the config it is
+        // given, not fall back to the runtime snapshot captured at tool
+        // construction.
+        let mut saved = (*stale_snapshot).clone();
+        saved
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+
+        let against_saved = tool.probe_model(&saved, "openai.default", "gpt-test").await;
+        assert!(
+            against_saved.is_err(),
+            "probe must resolve credentials from the saved alias config, not the stale runtime snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_does_not_swallow_provider_construction_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        cfg.providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(cfg.clone()), test_security());
+
+        let result = tool.probe_model(&cfg, "openai.default", "gpt-test").await;
+        let error = result.expect_err(
+            "a model_provider that fails to construct must not be reported as a passing probe",
+        );
+        assert!(error.to_string().contains("prefix mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn probe_model_falls_back_to_runtime_snapshot_credential_when_saved_config_has_none() {
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // Mirrors what `load_or_init` hands the tool at boot: decrypted, and
+        // with `ZEROCLAW_*` env-var bridged credentials already resolved
+        // onto the alias - something `load_config_without_env` never sees.
+        // Mismatched on purpose so a fallback attempt fails locally instead
+        // of reaching the network.
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-env-sourced-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        // The saved config - what `load_config_without_env` produced - has
+        // no credential for this alias at all.
+        let saved = (*base).clone();
+
+        let result = tool.probe_model(&saved, "openai.default", "gpt-test").await;
+        assert!(
+            result.is_err(),
+            "probe must fall back to the runtime snapshot's credential for this alias instead of silently skipping"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_keeps_config_when_probe_construction_error_is_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        // Seed a real (but provider-mismatched) credential onto the
+        // openai.default alias through a separate write, so the tool's own
+        // runtime snapshot never observes it - mirroring the "saved config
+        // the process hasn't seen yet" scenario the probe must read from.
+        let seed = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "default",
+                "model_provider": "openai",
+                "model": "placeholder",
+                "api_key": "sk-ant-not-an-openai-key"
+            }))
+            .await
+            .unwrap();
+        assert!(seed.success, "{:?}", seed.error);
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai",
+                "model": "gpt-test-model"
+            }))
+            .await
+            .unwrap();
+
+        // The probe now genuinely attempts construction and observes the
+        // credential mismatch, but that class of error is not classified as
+        // fatal by the existing retry/rollback heuristic, so a genuinely
+        // non-fatal probe outcome must still keep the newly saved model
+        // rather than roll it back.
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "default")
+            .expect("set_default must materialize the openai.default slot");
+        assert_eq!(entry.model.as_deref(), Some("gpt-test-model"));
     }
 }
