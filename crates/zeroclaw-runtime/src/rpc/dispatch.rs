@@ -605,45 +605,17 @@ impl RpcDispatcher {
         config: &zeroclaw_config::schema::Config,
         from: &str,
     ) -> bool {
-        if config.agent_workspace_dir(from).exists() {
-            return true;
-        }
-        if crate::cron::list_jobs_by_agent(config, from)
-            .map(|jobs| !jobs.is_empty())
-            .unwrap_or(true)
-        {
-            return true;
-        }
-        if let Some(store) = self.ctx.acp_session_store.as_ref()
-            && store
-                .list_sessions_by_agent(from)
-                .map(|sessions| !sessions.is_empty())
-                .unwrap_or(true)
-        {
-            return true;
-        }
-        if let Some(mem) = self.ctx.memory.as_ref()
-            && mem.count_agent(from).await.unwrap_or(1) > 0
-        {
-            return true;
-        }
-        let knowledge_path = config.knowledge.resolved_db_path();
-        if knowledge_path.exists() {
-            match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-                &knowledge_path,
-                config.knowledge.max_nodes,
-            ) {
-                Ok(graph) if graph.count_owner(from).unwrap_or(1) > 0 => return true,
-                Err(_) => return true,
-                Ok(_) => {}
-            }
-        }
-        if let Some(backend) = self.ctx.session_backend.as_ref()
-            && backend.count_agent_attribution(from).unwrap_or(1) > 0
-        {
-            return true;
-        }
-        false
+        // Shared committed-delete / committed-rename recovery contract; see
+        // `agent_owned_state::committed_delete_residue_exists`. Gateway, CLI,
+        // and RPC all route through it so a recoverable cascade failure
+        // converges identically on every supported surface.
+        crate::agent_owned_state::committed_delete_residue_exists(
+            config,
+            self.ctx.memory.as_ref(),
+            self.ctx.session_backend.as_ref(),
+            from,
+        )
+        .await
     }
 
     /// Read frames from transport, dispatch, repeat.

@@ -19,6 +19,80 @@ pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<us
         .context("count live ACP sessions for agent")
 }
 
+/// Does durable owned state still exist for `alias` after its config entry is
+/// already gone?
+///
+/// This is the shared **committed-delete recovery** contract. Every supported
+/// alias lifecycle surface (gateway, CLI, RPC) persists the removal of
+/// `agents.<alias>` *before* running the owned-state cascade, and that cascade
+/// deliberately refuses to purge rows when export or durable archive writing
+/// fails. Without this check the second attempt sees no config key and reports
+/// "not configured", stranding rows that are still stamped with the deleted
+/// alias — rows a recreated alias would inherit, which is an ADR-011
+/// confidentiality boundary rather than cleanup hygiene.
+///
+/// Callers use it to decide whether a delete for an absent config key should
+/// *re-enter* the cascade instead of failing. It is deliberately
+/// **fail-toward-residue**: a store that exists but cannot be read counts as
+/// residue, so a retry surfaces the underlying failure instead of declaring
+/// convergence over state it never managed to inspect.
+pub async fn committed_delete_residue_exists(
+    config: &Config,
+    mem: Option<&Arc<dyn Memory>>,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+    alias: &str,
+) -> bool {
+    if config.agent_workspace_dir(alias).exists() {
+        return true;
+    }
+
+    if crate::cron::list_jobs_by_agent(config, alias)
+        .map(|jobs| !jobs.is_empty())
+        .unwrap_or(true)
+    {
+        return true;
+    }
+
+    match AcpSessionStore::new(&config.data_dir) {
+        Ok(store) => {
+            if store
+                .list_sessions_by_agent(alias)
+                .map(|sessions| !sessions.is_empty())
+                .unwrap_or(true)
+            {
+                return true;
+            }
+        }
+        Err(_) => return true,
+    }
+
+    if let Some(mem) = mem
+        && mem.count_agent(alias).await.unwrap_or(1) > 0
+    {
+        return true;
+    }
+
+    let knowledge_path = config.knowledge.resolved_db_path();
+    if knowledge_path.exists() {
+        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        ) {
+            Ok(graph) if graph.count_owner(alias).unwrap_or(1) > 0 => return true,
+            Err(_) => return true,
+            Ok(_) => {}
+        }
+    }
+
+    if let Some(backend) = session_backend
+        && backend.count_agent_attribution(alias).unwrap_or(1) > 0
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Durable archive location and any workspace-archive failures that must be
 /// surfaced alongside the owned-store cascade.
 #[derive(Debug)]
