@@ -651,7 +651,21 @@ impl AnthropicModelProvider {
     /// entries are dropped before the request is sent. `None` keeps the request
     /// byte-identical to the pre-opt-in wire format. Streaming requests never
     /// call this.
-    fn server_fallbacks_for(&self, model: &str) -> Option<Vec<NativeFallbackEntry>> {
+    ///
+    /// `thinking` carries the resolved native-thinking config for the request.
+    /// Server-side fallback is never combined with native thinking: a fallback
+    /// target need not support the requested thinking budget, so the pairing is
+    /// excluded on every request shape rather than only on the streaming path.
+    /// Gating here rather than at each call site keeps the `fallbacks` param
+    /// and the opt-in beta header from diverging across entrypoints.
+    fn server_fallbacks_for(
+        &self,
+        model: &str,
+        thinking: Option<&NativeThinkingConfig>,
+    ) -> Option<Vec<NativeFallbackEntry>> {
+        if thinking.is_some() {
+            return None;
+        }
         let filtered: Vec<NativeFallbackEntry> = self
             .server_fallback_models
             .iter()
@@ -2545,7 +2559,8 @@ impl ModelProvider for AnthropicModelProvider {
             "API request"
         );
         // Non-streaming: opt into server-side fallback when configured.
-        let fallbacks = self.server_fallbacks_for(model);
+        // This entrypoint never enables native thinking, so nothing to gate.
+        let fallbacks = self.server_fallbacks_for(model, None);
         let extra_betas: &[&str] = if fallbacks.is_some() {
             &[ANTHROPIC_SERVER_FALLBACK_BETA]
         } else {
@@ -2660,8 +2675,9 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic provider request prepared"
             );
         }
-        // Non-streaming: opt into server-side fallback when configured.
-        let fallbacks = self.server_fallbacks_for(model);
+        // Non-streaming: opt into server-side fallback when configured, unless
+        // native thinking is active on this request.
+        let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
         let extra_betas: &[&str] = if fallbacks.is_some() {
             &[ANTHROPIC_SERVER_FALLBACK_BETA]
         } else {
@@ -7963,6 +7979,84 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "thinking request must not carry the server-side-fallback beta"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn direct_chat_thinking_request_never_carries_fallbacks() {
+        // Production reaches non-streaming `chat` with thinking active through
+        // explicit non-streaming calls, pre-output stream recovery, and the
+        // graceful-summary call. That path must exclude server-side fallback
+        // exactly like `stream_chat` does.
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1024,
+            }),
+        };
+        let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no direct chat request captured");
+        assert!(
+            body.get("thinking").is_some(),
+            "the request under test must actually have native thinking active: {body}"
+        );
+        assert!(
+            body.get("fallbacks").is_none(),
+            "a thinking direct-chat request must not carry a fallbacks param: {body}"
+        );
+        assert!(
+            !carries_server_fallback_beta(&headers),
+            "a thinking direct-chat request must not carry the server-side-fallback beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_chat_without_thinking_still_carries_fallbacks() {
+        // The gate must be scoped to thinking requests only; a plain
+        // non-streaming chat keeps the configured opt-in.
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no direct chat request captured");
+        assert!(
+            body.get("fallbacks").is_some(),
+            "a non-thinking direct-chat request must keep the configured fallbacks: {body}"
+        );
+        assert!(
+            carries_server_fallback_beta(&headers),
+            "a non-thinking direct-chat request must keep the server-side-fallback beta"
+        );
     }
 
     #[tokio::test]
