@@ -30,7 +30,8 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 
@@ -1749,8 +1750,13 @@ fn push_pinned_entries(
 
     let Some(primary_model) = primary_model else {
         out.push(
-            ReliableModelProviderEntry::new(family, cooldown_key, built)
-                .with_credential_rotation(credential_rotation),
+            ReliableModelProviderEntry::new_with_candidate(
+                family,
+                cooldown_key.clone(),
+                cooldown_key,
+                built,
+            )
+            .with_credential_rotation(credential_rotation),
         );
         return;
     };
