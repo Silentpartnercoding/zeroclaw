@@ -162,9 +162,53 @@ const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
 /// reload) must keep it and drain or cancel the driver when that lifetime ends;
 /// otherwise the driver keeps running against superseded configuration. Callers
 /// with no such boundary `drop` it to detach.
+/// A daemon generation's set of headless driver handles, plus whether that
+/// generation has finalized it.
+///
+/// Registration and finalization race by construction: an approval can resolve
+/// on a connection task whose listener has already stopped accepting, so a
+/// driver can be produced after the drain has taken the set. A bare vector
+/// accepts that handle into a collection nobody drains again, and the driver
+/// runs on under superseded config and permissions — the exact escape the
+/// generation boundary exists to prevent. Closing the set makes the late
+/// registration fail instead.
+#[derive(Debug, Default)]
+pub struct SopDriverRegistry {
+    drivers: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+impl SopDriverRegistry {
+    /// Handles this generation currently tracks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.drivers.len()
+    }
+
+    /// Whether this generation currently tracks no drivers.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.drivers.is_empty()
+    }
+
+    /// Whether the owning generation has finalized this set.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Take every tracked handle and close the set. Taking and closing are one
+    /// operation deliberately: a caller that took the handles without closing
+    /// would leave later registrations landing in a set it no longer drains.
+    pub fn close_and_take(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.closed = true;
+        std::mem::take(&mut self.drivers)
+    }
+}
+
 /// Shared handle set for headless run drivers, so every trigger source's
 /// drivers are owned by the same drain/reload boundary.
-pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<SopDriverRegistry>>;
 
 /// Owned spawner for headless run drivers at an ingress boundary.
 ///
@@ -241,13 +285,34 @@ pub fn spawn_headless_run_driver(
 /// finished entries, then add the new one. The set's owner (the daemon
 /// generation's driver supervisor) drains it at reload and shutdown, which is
 /// what keeps every registered driver inside one configuration boundary.
-pub fn register_sop_driver(handles: &SopDriverHandles, handle: tokio::task::JoinHandle<()>) {
+///
+/// Returns `false` when the set is already closed. A driver produced after its
+/// generation drained has no owner left to drain it, so it is aborted rather
+/// than tracked: letting it run would continue SOP work under superseded
+/// configuration and permissions, which is what the generation boundary
+/// forbids.
+pub fn register_sop_driver(
+    handles: &SopDriverHandles,
+    handle: tokio::task::JoinHandle<()>,
+) -> bool {
     let mut guard = match handles.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.retain(|existing| !existing.is_finished());
-    guard.push(handle);
+    if guard.is_closed() {
+        handle.abort();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "Refused a SOP driver registered after its generation drained; aborted it rather \
+             than leaving it running under superseded configuration"
+        );
+        return false;
+    }
+    guard.drivers.retain(|existing| !existing.is_finished());
+    guard.drivers.push(handle);
+    true
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -272,7 +337,12 @@ pub fn drive_resumed_broker_action(
         // Generation-owned: the daemon's driver supervisor drains this set at
         // reload and shutdown, so an approval-resumed driver cannot keep
         // working under superseded configuration unobserved.
-        Some(handles) => register_sop_driver(handles, handle),
+        // A refusal here means the generation drained between the approval
+        // resolving and this registration; `register_sop_driver` has already
+        // aborted the driver, so there is nothing further to do.
+        Some(handles) => {
+            register_sop_driver(handles, handle);
+        }
         // No generation supervisor on this surface (a one-shot command): the
         // process ends with the command, so the driver cannot outlive policy.
         None => drop(handle),

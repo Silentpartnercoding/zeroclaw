@@ -6021,7 +6021,10 @@ mod tests {
                 1,
                 "the resumed driver must register in the generation-owned set, not detach"
             );
-            guard.pop().expect("registered driver handle")
+            // Finalize exactly as the generation drain does, so this asserts
+            // against the same operation production uses.
+            let mut taken = guard.close_and_take();
+            taken.pop().expect("registered driver handle")
         };
         // The generation drain is a join on exactly these handles: a resumed
         // driver therefore ends inside the generation that spawned it instead

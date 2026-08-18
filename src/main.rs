@@ -8132,7 +8132,7 @@ fn spawn_sop_maintenance(
 /// Shared between every producer that registers drivers and the
 /// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
 #[cfg(feature = "agent-runtime")]
-type SopDriverSet = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+type SopDriverSet = zeroclaw_runtime::sop::SopDriverHandles;
 
 /// How long a daemon generation waits for its in-flight cron drivers to finish
 /// before aborting the stragglers. Long enough for a step already in a provider
@@ -8249,9 +8249,15 @@ impl SopDriverSupervisor {
         // out without dropping the handles, because dropping a `JoinHandle`
         // detaches its task rather than stopping it — and the abort arm still
         // has to join them.
+        // Closed, not merely emptied. A producer can outlive the point where
+        // its generation stops accepting work — an RPC connection task can
+        // resolve an approval after the listener stopped accepting — so a
+        // driver can still arrive here. Closing makes that registration fail
+        // instead of landing in a vector this generation will never drain
+        // again.
         let mut pending = match self.drivers.lock() {
-            Ok(mut drivers) => std::mem::take(&mut *drivers),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+            Ok(mut drivers) => drivers.close_and_take(),
+            Err(poisoned) => poisoned.into_inner().close_and_take(),
         };
         if pending.is_empty() {
             return still_running;
@@ -8400,17 +8406,7 @@ async fn run_sop_maintenance_tick(
                         // driver before a reload swaps the config and engine it
                         // captured. Finished handles are dropped on the way in
                         // so a long-lived daemon does not accumulate them.
-                        match drivers.lock() {
-                            Ok(mut drivers) => {
-                                drivers.retain(|driver| !driver.is_finished());
-                                drivers.push(driver);
-                            }
-                            Err(poisoned) => {
-                                let mut drivers = poisoned.into_inner();
-                                drivers.retain(|driver| !driver.is_finished());
-                                drivers.push(driver);
-                            }
-                        }
+                        zeroclaw_runtime::sop::register_sop_driver(drivers, driver);
                     }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
@@ -10793,7 +10789,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_hours(24)).await;
         });
         let drivers = SopDriverSet::default();
-        drivers.lock().unwrap().push(driver);
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, driver));
 
         // Short deadlines so the drain-expiry path runs without waiting out the
         // production ones; the logic under test is identical.
@@ -10892,16 +10888,18 @@ mod tests {
         // Ordered deliberately: the first resolves at once, so the drain
         // consumes its handle before the deadline; the second reaches no await
         // point and outlives both deadlines.
-        let quick = ::zeroclaw_spawn::spawn!(async {});
+        // Briefly pending rather than instantly complete: registration prunes
+        // finished handles, so a zero-await task would be pruned by the next
+        // registration and this test would lose the mixed batch it exists for.
+        let quick = ::zeroclaw_spawn::spawn!(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
         let stuck = ::zeroclaw_spawn::spawn!(async {
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
         let drivers = SopDriverSet::default();
-        {
-            let mut guard = drivers.lock().unwrap();
-            guard.push(quick);
-            guard.push(stuck);
-        }
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, quick));
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, stuck));
         let carried = SopDriverSupervisor {
             drivers,
             carried: Vec::new(),
@@ -10934,7 +10932,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
         let drivers = SopDriverSet::default();
-        drivers.lock().unwrap().push(driver);
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, driver));
 
         let started = std::time::Instant::now();
         let carried = SopDriverSupervisor {
@@ -10978,6 +10976,86 @@ mod tests {
         assert!(
             adopted_at.elapsed() < std::time::Duration::from_millis(500),
             "adopting an already-aborted driver must not re-drain it"
+        );
+    }
+
+    /// A producer can outlive the point where its generation stops taking work:
+    /// the RPC listener stops accepting while its existing connection tasks keep
+    /// running, so one of them can resolve an approval after the drain has
+    /// already taken the set. The drain therefore CLOSES the set rather than
+    /// merely emptying it — a driver arriving afterwards is refused and aborted,
+    /// instead of being pushed into a vector this generation will never drain
+    /// again and running on under superseded config and permissions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_registered_after_the_drain_is_refused_and_aborted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let drivers = SopDriverSet::default();
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.is_empty(),
+            "a generation with no drivers drains clean"
+        );
+        assert!(
+            drivers.lock().unwrap().is_closed(),
+            "the drain must close the set so late producers cannot join it"
+        );
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let late_flag = std::sync::Arc::clone(&stopped);
+        // Never finishes on its own: only the refusal's abort can stop it, so
+        // the flag below distinguishes "refused and cancelled" from "refused and
+        // silently detached", which would leave the task running unobserved.
+        let late = ::zeroclaw_spawn::spawn!(async move {
+            let _flag = StoppedFlag(late_flag);
+            start_flag.store(true, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+        // Wait until the task is actually executing. Aborting one that has never
+        // been polled drops the future before its body runs, so the drop guard
+        // would never exist and this test would pass or fail on scheduling luck
+        // rather than on the cancellation it means to prove.
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) && std::time::Instant::now() < start_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the late driver must be running before the refusal, or the abort proves nothing"
+        );
+
+        let registered = zeroclaw_runtime::sop::register_sop_driver(&drivers, late);
+
+        assert!(
+            !registered,
+            "a driver produced after its generation drained must be refused"
+        );
+        assert!(
+            drivers.lock().unwrap().is_empty(),
+            "the refused driver must not land in the drained set"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the refused driver must be aborted, not detached to run on unobserved"
         );
     }
 

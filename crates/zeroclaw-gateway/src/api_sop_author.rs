@@ -246,15 +246,24 @@ pub async fn handle_sop_run(
                 );
                 if needs_driver {
                     let config = state.config.read().clone();
-                    // Detached: a dashboard-initiated run outlives the request
-                    // that started it, so there is no caller lifetime to drain
-                    // against.
-                    drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
+                    let driver = zeroclaw_runtime::sop::spawn_headless_run_driver(
                         config,
                         std::sync::Arc::clone(engine),
                         Some(std::sync::Arc::clone(audit)),
                         action.as_ref().clone(),
-                    ));
+                    );
+                    // A dashboard run outlives the request that started it, but
+                    // it does not outlive the daemon generation whose config and
+                    // engine it captured: it registers with that generation's
+                    // set like every other surface, so one reload drains all of
+                    // them. Only a caller with no generation to belong to (a
+                    // standalone gateway) detaches.
+                    match state.sop_driver_handles.as_ref() {
+                        Some(handles) => {
+                            zeroclaw_runtime::sop::register_sop_driver(handles, driver);
+                        }
+                        None => drop(driver),
+                    }
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
             }
@@ -920,6 +929,33 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "an owned procedure must still start from the dashboard"
+        );
+    }
+
+    /// A dashboard run outlives the request that started it, but not the daemon
+    /// generation whose config and engine its driver captured. Detaching the
+    /// handle — the earlier behaviour — left that driver working across a reload
+    /// that superseded its configuration, with nothing left to drain or observe
+    /// it. It registers with the generation's set like every other surface.
+    #[tokio::test]
+    async fn manual_run_registers_its_driver_with_the_generation_set() {
+        let (_tmp, mut state) = manual_run_state(manual_execute_sop(Some("ops")));
+        let handles = zeroclaw_runtime::sop::SopDriverHandles::default();
+        state.sop_driver_handles = Some(Arc::clone(&handles));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody { payload: None }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            handles.lock().unwrap().len(),
+            1,
+            "the dashboard-started driver must join the generation-owned set rather than detach"
         );
     }
 
