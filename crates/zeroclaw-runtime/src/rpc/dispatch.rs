@@ -4312,6 +4312,21 @@ impl RpcDispatcher {
     /// output, and captured tool calls. `sops/runs` intentionally returns
     /// summaries; this is the drill-down a UI uses for a selected run.
     fn handle_sops_run_detail(&self, params: &Value) -> RpcResult {
+        // Local transports only. This dispatcher serves both owner-scoped local
+        // IPC and remote WSS, and a fresh WSS caller can complete `initialize`
+        // without presenting a client credential and still be marked
+        // authenticated — so on that transport this method would hand step
+        // output, tool arguments and errors to anyone who can reach the socket.
+        // The accepted remote-authentication RFC has no implementation on this
+        // branch, so run detail stays off WSS rather than widening a hole it
+        // does not own. Lift this once that boundary lands.
+        if self.peer_label.starts_with("wss:") {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                "sops/run-detail is not served over remote WSS: the transport has no \
+                 authenticated principal to authorize run contents against",
+            ));
+        }
         let req: SopRunDetailRequest = parse_params(params)?;
         let engine = self
             .ctx
@@ -5001,7 +5016,15 @@ mod tests {
                     tool_calls: vec![StepToolCall {
                         index: 0,
                         tool: "shell".into(),
-                        args: serde_json::json!({"token": "ARGSECRET888888"}),
+                        // Not just a direct string: a credential-named key
+                        // routinely carries its secret in a container or a bare
+                        // number, and those descendants name nothing sensitive.
+                        args: serde_json::json!({
+                            "token": "ARGSECRET888888",
+                            "api_key": {"value": "NESTEDSECRET33333"},
+                            "credential": ["ARRAYSECRET22222"],
+                            "password": 987654321,
+                        }),
                         success: true,
                         output: "done password=TOOLSECRET77777".into(),
                         output_data: Some(serde_json::json!({"x": "DATASECRET44444"})),
@@ -5087,6 +5110,9 @@ mod tests {
             "TOOLSECRET77777",
             "DATASECRET44444",
             "TOPICSECRET66666",
+            "NESTEDSECRET33333",
+            "ARRAYSECRET22222",
+            "987654321",
         ] {
             assert!(
                 !wire.contains(secret),
@@ -5105,6 +5131,48 @@ mod tests {
                 "{excluded} must not be on the wire"
             );
         }
+    }
+
+    /// The dispatcher serves owner-scoped local IPC and remote WSS alike, and a
+    /// fresh WSS caller can finish `initialize` with no client credential and
+    /// still be treated as authenticated. Run detail carries step output, tool
+    /// arguments and errors, so on that transport it must refuse outright until
+    /// there is a principal to authorize against — a caller that can reach the
+    /// socket must not be able to read what a run did.
+    #[tokio::test]
+    async fn sops_run_detail_is_refused_over_remote_wss() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let engine = Arc::new(Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "wss:203.0.113.7:44321".to_string());
+
+        let err = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": "run-anything" }))
+            .expect_err("run detail must not answer a remote WSS caller");
+
+        assert_eq!(
+            err.code, AUTH_REQUIRED,
+            "the refusal must read as missing authentication, not a lookup failure"
+        );
+        // Refused before the run id is even parsed: an unauthenticated caller
+        // must not be able to probe which run ids exist.
+        assert!(
+            !err.message.contains("not found"),
+            "the refusal must not double as a run-id oracle, got {}",
+            err.message
+        );
     }
 
     use super::*;
