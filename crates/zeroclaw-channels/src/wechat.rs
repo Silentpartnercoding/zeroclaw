@@ -196,12 +196,20 @@ fn classify_workspace_io(err: &std::io::Error) -> AttachmentDisposition {
     use std::io::ErrorKind;
     match err.kind() {
         // Operator-action conditions: permissions, a read-only mount, a
-        // workspace path that is not (or is not under) a directory, or a
-        // malformed path. None of these change by retrying.
+        // workspace path that is not (or is not under) a directory, a
+        // malformed path, or a path already occupied by a conflicting
+        // entry. None of these change by retrying.
+        //
+        // `AlreadyExists` is the EEXIST that `create_dir_all` returns when
+        // the attachment directory path is occupied by a regular file: no
+        // amount of re-fetching from the CDN turns that file into a
+        // directory, so treating it as transient would wedge every later
+        // inbound message behind the held batch.
         ErrorKind::PermissionDenied
         | ErrorKind::ReadOnlyFilesystem
         | ErrorKind::NotADirectory
         | ErrorKind::IsADirectory
+        | ErrorKind::AlreadyExists
         | ErrorKind::InvalidInput
         | ErrorKind::InvalidFilename => AttachmentDisposition::Permanent,
         // Transient: unavailable mount, ENOSPC, EINTR, and anything the
@@ -4543,6 +4551,7 @@ mod tests {
             ErrorKind::ReadOnlyFilesystem,
             ErrorKind::NotADirectory,
             ErrorKind::IsADirectory,
+            ErrorKind::AlreadyExists,
             ErrorKind::InvalidInput,
             ErrorKind::InvalidFilename,
         ] {
@@ -4692,6 +4701,129 @@ mod tests {
         let mut perms = std::fs::metadata(&workspace_dir).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&workspace_dir, perms).unwrap();
+    }
+
+    /// Same invariant as the read-only-workspace regression above, for
+    /// the collision that needs no permission trick and so reproduces on
+    /// every platform: `workspace/wechat_files` already exists as a
+    /// regular file.
+    ///
+    /// `create_dir_all` then returns EEXIST (`ErrorKind::AlreadyExists`).
+    /// Retrying the CDN cannot turn a file into a directory, so if this
+    /// were classified `Retryable` the listener would retain the cursor
+    /// and re-poll the same batch forever, wedging every later inbound
+    /// message. It must be `Permanent`: the attachment is dropped, the
+    /// text still delivers, and the cursor commits.
+    #[tokio::test]
+    async fn listen_does_not_hold_batch_when_attachment_dir_path_is_a_file() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        // The collision: the attachment directory path is occupied by a
+        // regular file, so `create_dir_all` fails with EEXIST forever.
+        std::fs::write(workspace_dir.join("wechat_files"), b"not a directory").unwrap();
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        // The CDN is healthy throughout: the only failure is local.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an occupied attachment dir path must not hold inbound delivery")
+            .expect("channel closed before delivery");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("hello"),
+            "the text must still be delivered, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:"),
+            "the attachment is unsaveable, so no marker may be claimed, got: {}",
+            msg.content
+        );
+
+        let mut committed = false;
+        for _ in 0..100 {
+            if *ch.cursor.lock() == "cursor_after_batch" {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            committed,
+            "an EEXIST attachment-dir collision must not retain the cursor: still at {:?}",
+            *ch.cursor.lock()
+        );
+
+        // The colliding file is untouched: nothing tried to write through it.
+        assert_eq!(
+            std::fs::read(workspace_dir.join("wechat_files")).unwrap(),
+            b"not a directory",
+            "the colliding file must not be overwritten"
+        );
+
+        handle.abort();
+        let _ = handle.await;
     }
 
     /// The restart-while-cursor-pending regression, and the gap the
