@@ -1145,6 +1145,38 @@ impl WeChatChannel {
         parts.next().map(str::trim).filter(|code| !code.is_empty())
     }
 
+    fn build_inbound_channel_message(
+        &self,
+        from_user_id: &str,
+        message_id: String,
+        text: &str,
+        timestamp: u64,
+        attachment_content: Option<String>,
+    ) -> Option<Box<ChannelMessage>> {
+        let content = match (attachment_content, text.is_empty()) {
+            (Some(marker), true) => marker,
+            (Some(marker), false) => format!("{marker}\n\n{text}"),
+            (None, false) => text.to_string(),
+            (None, true) => return None,
+        };
+
+        Some(Box::new(ChannelMessage {
+            id: message_id,
+            sender: from_user_id.to_string(),
+            reply_target: from_user_id.to_string(),
+            content,
+            channel: "wechat".to_string(),
+            channel_alias: Some(self.alias.clone()),
+            timestamp,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+
+            ..Default::default()
+        }))
+    }
+
     fn api_url(&self, endpoint: &str) -> String {
         let base = self.api_base_url.trim_end_matches('/');
         format!("{base}/ilink/bot/{endpoint}")
@@ -2568,61 +2600,56 @@ impl Channel for WeChatChannel {
             // attachment that will never succeed would wedge the listener.
             let mut batch_has_retryable_attachment_failure = false;
 
-            // Everything the batch wants to do downstream, staged in batch
-            // order. Nothing is published to `tx` — and no unauthorized-user
-            // side effect (pairing attempt, reply) runs — until the ENTIRE
-            // batch has been prepared without a retryable attachment
-            // failure. Publishing earlier would redeliver every
-            // already-sent message on each held-batch re-poll: the cursor
-            // is retained across held passes, so the same batch is fetched
-            // again and any message that already crossed `tx.send` would
-            // start another agent turn (and repeat downstream tool
-            // effects) per pass.
+            // Everything the batch wants to do downstream is staged in batch
+            // order. Nothing is published to `tx` until every attachment the
+            // sender is currently authorized to fetch has prepared cleanly.
+            // Messages that may become authorized through an earlier staged
+            // `/bind` retain only their transport fields; their attachment I/O
+            // runs in the authorization-aware preparation phase below. This
+            // prevents unauthenticated CDN/workspace side effects while still
+            // keeping every inbound agent turn unpublished until the batch is
+            // complete.
             enum StagedInbound {
                 /// An authorized message, fully prepared and ready to
                 /// publish downstream.
                 Deliver(Box<ChannelMessage>),
-                /// A fully prepared message that follows a syntactically
-                /// valid `/bind` from the same sender in this batch. The
-                /// bind has deliberately not run yet: preparation must
-                /// finish for the whole batch before any pairing or reply
-                /// side effect occurs. At publish time authorization is
-                /// resolved again from the canonical Config-backed peer
-                /// resolver, after the earlier staged bind has had a chance
-                /// to persist it.
+                /// A message that follows a syntactically valid `/bind` from
+                /// the same sender in this batch. Its
+                /// attachment is deliberately NOT fetched or written while
+                /// the sender is unauthorized. Before publication, the
+                /// earlier bind runs, authorization is resolved again from
+                /// the canonical Config-backed peer resolver, and only then
+                /// may attachment preparation cross the CDN/workspace trust
+                /// boundary.
                 DeliverIfAuthorized {
-                    message: Box<ChannelMessage>,
-                    unauthorized_text: String,
+                    from_user_id: String,
+                    items: Vec<serde_json::Value>,
+                    message_id: String,
+                    text: String,
+                    timestamp: u64,
                 },
                 /// A message from an unauthorized sender. Handling it has
-                /// side effects (pairing attempts, outbound replies), so
-                /// it is deferred the same way as delivery: a held batch
-                /// re-polls these messages, and running the side effect on
-                /// every held pass would spam pairing replies.
-                ///
-                /// Liveness trade-off, accepted deliberately: a `/bind`
-                /// that arrives in the same batch as a later message whose
-                /// attachment keeps failing retryably waits behind that
-                /// attachment, even though pairing does not depend on it.
-                /// The alternative — carving control-plane messages out of
-                /// the deferral — reintroduces the repeated-reply bug this
-                /// staging exists to fix, since a held batch re-delivers
-                /// the same `/bind` on every pass. The exposure is bounded:
-                /// only a CDN failure that keeps reporting retryable can
-                /// sustain it (a local workspace failure an operator must
-                /// clear is classified `Permanent` by
-                /// `classify_workspace_io`, so it commits rather than
-                /// holding), and the hold itself backs off to
-                /// `ATTACHMENT_RETRY_MAX_DELAY`.
+                /// side effects (pairing attempts, outbound replies), so it
+                /// is deferred until the authorization-aware preparation
+                /// phase. A successful bind may therefore update canonical
+                /// authorization before a dependent attachment later reports
+                /// a retryable failure. The cursor remains pending, but the
+                /// replay sees that canonical authorization and treats the
+                /// already-applied `/bind` as a control no-op, preventing a
+                /// second attempt or reply.
                 Unauthorized { from_user_id: String, text: String },
+                /// A control message or empty message that has already been
+                /// handled during authorization-aware preparation and must
+                /// not be published downstream.
+                Skip,
             }
             let mut staged: Vec<StagedInbound> = Vec::new();
             // Ephemeral materialized view of possible authorization
             // transitions inside this one batch. It is not authorization
-            // state: the publish phase always re-resolves the canonical
-            // Config-backed peer list before delivery. Its sole purpose is
-            // to make us fully prepare later messages (including CDN
-            // attachments) before executing a preceding `/bind`.
+            // state: the preparation phase always re-resolves the canonical
+            // Config-backed peer list before delivery or attachment I/O. Its
+            // sole purpose is to defer later messages until a preceding
+            // `/bind` has been evaluated in message order.
             let mut staged_bind_senders = std::collections::HashSet::new();
 
             for msg in &msgs {
@@ -2658,10 +2685,19 @@ impl Channel for WeChatChannel {
                 // Resolve current authorization from the canonical peer
                 // configuration. A prior `/bind` from this sender in the
                 // same batch is only a possible transition: prepare this
-                // message now, but re-check the canonical source at publish
-                // time after that bind actually runs.
+                // message's transport metadata now, but do not fetch its
+                // attachment. Re-check the canonical source after that bind
+                // runs, before crossing the CDN/workspace trust boundary.
                 let currently_authorized = self.is_user_allowed(from_user_id);
                 let may_be_authorized_by_staged_bind = staged_bind_senders.contains(from_user_id);
+                if currently_authorized && Self::extract_bind_code(&text).is_some() {
+                    // A held batch can be replayed after its bind already
+                    // succeeded but before the attachment and cursor commit.
+                    // Treat that replayed control message as a no-op: it must
+                    // not reach the agent and must not repeat the pairing
+                    // attempt or success reply.
+                    continue;
+                }
                 if !currently_authorized && !may_be_authorized_by_staged_bind {
                     if Self::extract_bind_code(&text).is_some() {
                         staged_bind_senders.insert(from_user_id.to_string());
@@ -2669,6 +2705,28 @@ impl Channel for WeChatChannel {
                     staged.push(StagedInbound::Unauthorized {
                         from_user_id: from_user_id.to_string(),
                         text,
+                    });
+                    continue;
+                }
+
+                let timestamp = msg
+                    .get("create_time_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    / 1000; // Convert to seconds
+
+                if !currently_authorized {
+                    // The sender is not authorized yet, so even a syntactically
+                    // valid preceding bind cannot authorize network or
+                    // filesystem side effects. Keep the raw transport fields
+                    // ephemeral until publication applies the bind and the
+                    // canonical peer resolver confirms the transition.
+                    staged.push(StagedInbound::DeliverIfAuthorized {
+                        from_user_id: from_user_id.to_string(),
+                        items,
+                        message_id,
+                        text,
+                        timestamp,
                     });
                     continue;
                 }
@@ -2692,105 +2750,110 @@ impl Channel for WeChatChannel {
                             break;
                         }
                     };
-                let unauthorized_text = (!currently_authorized).then(|| text.clone());
-                let content = match (attachment_content, text.is_empty()) {
-                    (Some(marker), true) => marker,
-                    (Some(marker), false) => format!("{marker}\n\n{text}"),
-                    (None, false) => text,
-                    (None, true) => continue,
-                };
-
-                let timestamp = msg
-                    .get("create_time_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-                    / 1000; // Convert to seconds
-
-                let channel_msg = ChannelMessage {
-                    id: message_id,
-                    sender: from_user_id.to_string(),
-                    reply_target: from_user_id.to_string(),
-                    content,
-                    channel: "wechat".to_string(),
-                    channel_alias: Some(self.alias.clone()),
+                if let Some(channel_msg) = self.build_inbound_channel_message(
+                    from_user_id,
+                    message_id,
+                    &text,
                     timestamp,
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
+                    attachment_content,
+                ) {
+                    staged.push(StagedInbound::Deliver(channel_msg));
+                }
+            }
 
-                    ..Default::default()
-                };
+            // Apply authorization transitions and prepare their dependent
+            // messages before ANY message crosses `tx.send`. This second
+            // preparation phase is necessary because attachment I/O for an
+            // unauthorized sender must not run merely because a preceding
+            // message looks like `/bind CODE`: only the canonical peer source
+            // after `try_pair` may authorize that CDN request and workspace
+            // write.
+            if !batch_has_retryable_attachment_failure {
+                for item in &mut staged {
+                    let pending = std::mem::replace(item, StagedInbound::Skip);
+                    match pending {
+                        StagedInbound::Deliver(message) => {
+                            *item = StagedInbound::Deliver(message);
+                        }
+                        StagedInbound::Unauthorized { from_user_id, text } => {
+                            self.handle_unauthorized_message(&from_user_id, &text).await;
+                        }
+                        StagedInbound::DeliverIfAuthorized {
+                            from_user_id,
+                            items,
+                            message_id,
+                            text,
+                            timestamp,
+                        } => {
+                            if !self.is_user_allowed(&from_user_id) {
+                                // The preceding bind was invalid or could
+                                // not make this sender canonical. Fail
+                                // closed without fetching or persisting the
+                                // attachment.
+                                self.handle_unauthorized_message(&from_user_id, &text).await;
+                                continue;
+                            }
 
-                if let Some(unauthorized_text) = unauthorized_text {
-                    staged.push(StagedInbound::DeliverIfAuthorized {
-                        message: Box::new(channel_msg),
-                        unauthorized_text,
-                    });
-                } else {
-                    staged.push(StagedInbound::Deliver(Box::new(channel_msg)));
+                            let attachment_content = match self
+                                .try_build_attachment_content(&items, &message_id)
+                                .await
+                            {
+                                AttachmentDisposition::Ready(marker) => Some(marker),
+                                AttachmentDisposition::None | AttachmentDisposition::Permanent => {
+                                    None
+                                }
+                                AttachmentDisposition::Retryable => {
+                                    // The bind has already updated the
+                                    // canonical peer source, but no inbound
+                                    // message has crossed `tx.send`. Hold the
+                                    // cursor and replay. On that replay the
+                                    // now-authorized `/bind` is a control
+                                    // no-op, so its one-time code and reply
+                                    // are not repeated.
+                                    batch_has_retryable_attachment_failure = true;
+                                    break;
+                                }
+                            };
+
+                            if let Some(message) = self.build_inbound_channel_message(
+                                &from_user_id,
+                                message_id,
+                                &text,
+                                timestamp,
+                                attachment_content,
+                            ) {
+                                *item = StagedInbound::Deliver(message);
+                            }
+                        }
+                        StagedInbound::Skip => {}
+                    }
                 }
             }
 
             // Publish only after the WHOLE batch prepared cleanly. A
             // retryable failure discards the staged messages instead —
             // they are re-fetched with the held cursor on the next pass,
-            // so nothing is lost, and nothing was delivered twice.
+            // so no inbound agent turn is delivered twice.
             if !batch_has_retryable_attachment_failure {
                 for item in staged {
-                    match item {
-                        StagedInbound::Deliver(channel_msg) => {
-                            if tx.send(*channel_msg).await.is_err() {
-                                ::zeroclaw_log::record!(
-                                    INFO,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    ),
-                                    "channel receiver dropped, stopping"
-                                );
-                                // Do NOT commit `next_cursor` here: the batch is
-                                // only partially (or not at all) enqueued, so the
-                                // old cursor must stay on disk. On supervised
-                                // restart `listen()` reloads it and re-polls this
-                                // batch.
-                                return Ok(());
-                            }
-                        }
-                        StagedInbound::DeliverIfAuthorized {
-                            message,
-                            unauthorized_text,
-                        } => {
-                            if self.is_user_allowed(&message.sender) {
-                                if tx.send(*message).await.is_err() {
-                                    ::zeroclaw_log::record!(
-                                        INFO,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        ),
-                                        "channel receiver dropped, stopping"
-                                    );
-                                    // As for `Deliver`, retain the old cursor
-                                    // when this batch was not fully enqueued.
-                                    return Ok(());
-                                }
-                            } else {
-                                // The preceding bind was invalid or could
-                                // not make this sender canonical. Fail
-                                // closed through the ordinary unauthorized
-                                // handler rather than delivering based on
-                                // the staging hint.
-                                self.handle_unauthorized_message(
-                                    &message.sender,
-                                    &unauthorized_text,
-                                )
-                                .await;
-                            }
-                        }
-                        StagedInbound::Unauthorized { from_user_id, text } => {
-                            self.handle_unauthorized_message(&from_user_id, &text).await;
-                        }
+                    let StagedInbound::Deliver(channel_msg) = item else {
+                        continue;
+                    };
+                    if tx.send(*channel_msg).await.is_err() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "channel receiver dropped, stopping"
+                        );
+                        // Do NOT commit `next_cursor` here: the batch is
+                        // only partially (or not at all) enqueued, so the
+                        // old cursor must stay on disk. On supervised
+                        // restart `listen()` reloads it and re-polls this
+                        // batch.
+                        return Ok(());
                     }
                 }
             }
@@ -3992,12 +4055,137 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// A later retryable attachment failure keeps the entire batch
-    /// side-effect-free. The `/bind` must not consume its one-time code or
-    /// send a success reply until a replay can prepare the attachment; on
-    /// recovery the bind and message each happen exactly once.
+    /// A syntactically valid `/bind` is only a staging hint, not authority.
+    /// An invalid code followed by an attachment from the same sender must
+    /// not trigger a CDN request or workspace write before canonical pairing
+    /// succeeds.
     #[tokio::test]
-    async fn listen_defers_bind_until_following_attachment_recovers() {
+    async fn listen_does_not_fetch_attachment_after_invalid_staged_bind() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, valid_pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+        let invalid_pairing_code = format!("{valid_pairing_code}x");
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "unpaired_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {invalid_pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "unpaired_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": "unauthorized attachment"}},
+                        {
+                            "type": 2,
+                            "image_item": {
+                                "media": {"encrypt_query_param": "must_not_be_fetched"}
+                            }
+                        }
+                    ]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *channel.cursor.lock() != "cursor_after_batch" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("invalid bind batch must advance without attachment I/O");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "an invalid bind must not deliver its following attachment"
+        );
+        assert!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias")
+                .is_empty(),
+            "invalid pairing must not update the canonical peer source"
+        );
+        assert!(
+            !temp.path().join("workspace/wechat_files").exists(),
+            "unauthorized attachment staging must not create its workspace directory"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "GET")
+                .count(),
+            0,
+            "invalid pairing must not authorize any CDN request"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "the invalid-code reply should be sent once"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Attachment I/O for a staged-bind sender starts only after the bind
+    /// updates canonical authorization. If that newly authorized fetch is
+    /// retryable, the cursor stays pending; replay treats the already-applied
+    /// `/bind` as a control no-op so the pairing attempt and reply happen once,
+    /// while the inbound message still waits for the attachment.
+    #[tokio::test]
+    async fn listen_replays_post_bind_attachment_failure_without_rebinding() {
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4081,12 +4269,12 @@ mod tests {
 
         let held = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
         assert!(held.is_err(), "held batch must publish no message");
-        assert!(
+        assert_eq!(
             config
                 .read()
-                .channel_external_peers("wechat", "wechat_test_alias")
-                .is_empty(),
-            "held batch must not execute the staged bind"
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()],
+            "the bind must establish canonical authorization before attachment I/O"
         );
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(
@@ -4094,8 +4282,8 @@ mod tests {
                 .iter()
                 .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
                 .count(),
-            0,
-            "held batch must not send a premature pairing reply"
+            1,
+            "the successful bind reply must be sent once before the held replay"
         );
 
         let delivered = tokio::time::timeout(Duration::from_secs(20), rx.recv())
