@@ -4636,9 +4636,11 @@ path = "{trigger_path}"
         sop_config.persist_runs = false;
         state.config.write().sop = sop_config.clone();
         let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
             &data_dir,
+            &install_root,
             Arc::clone(&state.mem),
             Default::default(),
         );
@@ -4690,9 +4692,11 @@ path = "{trigger_path}"
         sop_config.persist_runs = false;
         state.config.write().sop = sop_config.clone();
         let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
             sop_config,
             &data_dir,
+            &install_root,
             Arc::clone(&state.mem),
             Default::default(),
         );
