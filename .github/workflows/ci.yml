@@ -348,6 +348,13 @@ jobs:
           cargo test --profile ci --locked -p zeroclaw-runtime --lib
           interactive_signal_lifecycle
           --target x86_64-pc-windows-msvc
+      - name: Test interactive stdin ownership lifecycle
+        if: runner.os == 'Windows' && needs.interactive-ctrlc-changes.outputs.run == 'true'
+        shell: bash
+        run: >-
+          cargo test --profile ci --locked -p zeroclaw-runtime --lib
+          interactive_input_lifecycle
+          --target x86_64-pc-windows-msvc
       - name: Check voice-wake
         if: runner.os != 'Linux'
         shell: bash
