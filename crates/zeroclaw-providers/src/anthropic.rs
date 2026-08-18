@@ -3605,9 +3605,27 @@ data: {\"type\":\"message_stop\"}\n\n";
             );
             assert!(attrs.get("credential_head").is_none());
             assert!(attrs.get("credential_tail").is_none());
+            let former_head: String = credential.chars().take(8).collect();
+            let former_tail: String = credential
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let serialized = event.to_string();
             assert!(
-                !event.to_string().contains(credential),
+                !serialized.contains(credential),
                 "authentication event must not contain credential material"
+            );
+            assert!(
+                !serialized.contains(&former_head),
+                "authentication event must not contain the credential prefix"
+            );
+            assert!(
+                !serialized.contains(&former_tail),
+                "authentication event must not contain the credential suffix"
             );
         }
 
