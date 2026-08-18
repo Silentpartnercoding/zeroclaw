@@ -10,7 +10,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 use zeroclaw_config::schema::OtelContentPolicy;
 
@@ -935,6 +935,7 @@ impl Observer for OtelObserver {
 
 fn strip_runtime_user_timestamp_prefix(content: &str) -> &str {
     const LABEL: &str = "[CURRENT DATE & TIME:";
+    static TIMESTAMP_PATTERN: OnceLock<regex::Regex> = OnceLock::new();
 
     let Some(rest) = content.strip_prefix(LABEL) else {
         return content;
@@ -943,8 +944,10 @@ fn strip_runtime_user_timestamp_prefix(content: &str) -> &str {
         return content;
     };
     let timestamp = rest[..bracket_end].trim();
-    let timestamp_regex =
-        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+$").unwrap();
+    let timestamp_regex = TIMESTAMP_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+$")
+            .expect("the runtime timestamp pattern is a valid fixed regex")
+    });
     if !timestamp_regex.is_match(timestamp) {
         return content;
     }
@@ -968,7 +971,7 @@ fn strip_first_complete_block(content: &mut String, start_marker: &str, end_mark
 }
 
 fn clean_for_display(content: &str) -> String {
-    let mut cleaned = strip_runtime_user_timestamp_prefix(content).to_string();
+    let mut cleaned = content.to_string();
 
     strip_first_complete_block(&mut cleaned, "[Memory context]", "[/Memory context]");
     strip_first_complete_block(&mut cleaned, "<tool_result", "</tool_result>");
@@ -976,8 +979,8 @@ fn clean_for_display(content: &str) -> String {
     strip_first_complete_block(&mut cleaned, "<think>", "</think>");
 
     // Preserve the pre-existing cleanup for bare timestamps. The labeled
-    // runtime envelope is removed only at the leading user-message boundary
-    // above so user-authored examples later in the message remain intact.
+    // runtime envelope is removed only at the role-aware agent-message export
+    // boundary so user-authored examples later in the message remain intact.
     let timestamp_regex =
         regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]").unwrap();
     cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
@@ -1005,7 +1008,12 @@ fn process_agent_message(
     policy: OtelContentPolicy,
     max_chars: usize,
 ) -> Option<String> {
-    let cleaned = clean_for_display(content);
+    let display_content = if role == "user" {
+        strip_runtime_user_timestamp_prefix(content)
+    } else {
+        content
+    };
+    let cleaned = clean_for_display(display_content);
     let processed = if policy == OtelContentPolicy::Redacted {
         truncate_field(&cleaned, max_chars)
     } else {
@@ -2008,6 +2016,19 @@ mod tests {
     }
 
     #[test]
+    fn process_agent_message_preserves_leading_timestamp_text_for_assistant() {
+        let content = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nquoted assistant answer";
+        let val = process_agent_message(content, "assistant", OtelContentPolicy::Full, 10_000)
+            .expect("aggregate agent output attribute");
+        let parsed: serde_json::Value = serde_json::from_str(&val).unwrap();
+        assert_eq!(parsed[0]["role"], "assistant");
+        assert_eq!(
+            parsed[0]["content"],
+            "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\nquoted assistant answer"
+        );
+    }
+
+    #[test]
     fn process_agent_message_redacted_truncates() {
         // Truncation drops the content entirely → None.
         assert!(process_agent_message("abcdef", "user", OtelContentPolicy::Redacted, 0,).is_none());
@@ -2074,17 +2095,18 @@ mod tests {
     }
 
     #[test]
-    fn clean_for_display_removes_labeled_timestamp_prefix() {
+    fn strip_runtime_user_timestamp_prefix_removes_numeric_timezone() {
         let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 +08:00]\n\nHello world";
-        let cleaned = clean_for_display(input);
-        assert_eq!(cleaned, "Hello world");
+        assert_eq!(strip_runtime_user_timestamp_prefix(input), "Hello world");
     }
 
     #[test]
-    fn clean_for_display_removes_labeled_timestamp_with_named_tz() {
+    fn strip_runtime_user_timestamp_prefix_removes_named_timezone() {
         let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nWhat is the weather today";
-        let cleaned = clean_for_display(input);
-        assert_eq!(cleaned, "What is the weather today");
+        assert_eq!(
+            strip_runtime_user_timestamp_prefix(input),
+            "What is the weather today"
+        );
     }
 
     #[test]
