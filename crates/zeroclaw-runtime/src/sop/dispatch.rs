@@ -270,6 +270,52 @@ fn action_label(action: &SopRunAction) -> &'static str {
     }
 }
 
+/// Project a deterministic-driver error from the canonical run state.
+///
+/// A driver error does not prove that the run durably failed. In particular,
+/// cancellation or step-budget terminal persistence can fail after the engine
+/// deliberately retains the active run and its claim for maintenance retry.
+/// Treating every error as `Failed` would publish a terminal outcome that the
+/// run store does not contain.
+fn project_driver_error(
+    eng: &SopEngine,
+    run_id: &str,
+    sop_name: &str,
+    error: &anyhow::Error,
+) -> SopRunAction {
+    let Some(run) = eng.get_run(run_id) else {
+        return SopRunAction::Failed {
+            run_id: run_id.to_string(),
+            sop_name: sop_name.to_string(),
+            reason: error.to_string(),
+        };
+    };
+
+    match run.status {
+        super::types::SopRunStatus::Completed => SopRunAction::Completed {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+        },
+        super::types::SopRunStatus::Cancelled => SopRunAction::Cancelled {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+        },
+        super::types::SopRunStatus::Failed => SopRunAction::Failed {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            reason: error.to_string(),
+        },
+        status => SopRunAction::Pending {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            step: run.current_step,
+            reason: format!(
+                "deterministic driver exited with run retained as {status}; maintenance or the lifecycle owner will reconcile it: {error}"
+            ),
+        },
+    }
+}
+
 /// Post-start bookkeeping shared by the single-SOP loop and the AMQP batch path.
 /// Deterministic actions are queued for the shared driver after the engine lock
 /// is released; `action` is the first action returned by activation.
@@ -924,11 +970,13 @@ async fn dispatch_sop_event_filtered(
         let final_action =
             match super::executor::drive_shared_deterministic_run(engine, first_action).await {
                 Ok(action) => action,
-                Err(e) => SopRunAction::Failed {
-                    run_id: run_id.clone(),
-                    sop_name,
-                    reason: e.to_string(),
-                },
+                Err(e) => {
+                    let eng = match engine.lock() {
+                        Ok(eng) => eng,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    project_driver_error(&eng, &run_id, &sop_name, &e)
+                }
             };
         if let Some(DispatchResult::Started { action, .. }) = results.iter_mut().find(|result| {
             matches!(
@@ -1434,6 +1482,84 @@ mod tests {
 
     fn test_audit() -> SopAuditLogger {
         SopAuditLogger::new(Arc::new(TestMemory::default()))
+    }
+
+    #[test]
+    fn driver_error_projection_preserves_requested_cancellation() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-projection", vec![])]);
+        let first = engine
+            .start_run(
+                "cancel-projection",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = extract_run_id_from_action(&first).to_string();
+        let outcome = engine
+            .cancel_run_idempotent(&run_id, Some("stop".to_string()), None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Some(crate::sop::engine::CancelOutcome::Requested)
+        ));
+
+        let projected = project_driver_error(
+            &engine,
+            &run_id,
+            "cancel-projection",
+            &anyhow::anyhow!("terminal write unavailable"),
+        );
+
+        assert!(matches!(
+            projected,
+            SopRunAction::Pending {
+                run_id: ref projected_run_id,
+                ref reason,
+                ..
+            } if projected_run_id == &run_id
+                && reason.contains("retained as cancel_requested")
+        ));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            crate::sop::types::SopRunStatus::CancelRequested,
+            "the dispatch projection must not replace the canonical retained state"
+        );
+    }
+
+    #[test]
+    fn driver_error_projection_uses_reconciled_terminal_state() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-projection", vec![])]);
+        let first = engine
+            .start_run(
+                "cancel-projection",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = extract_run_id_from_action(&first).to_string();
+        engine
+            .cancel_run_idempotent(&run_id, Some("stop".to_string()), None)
+            .unwrap();
+        engine.finish_requested_cancellation(&run_id).unwrap();
+
+        let projected = project_driver_error(
+            &engine,
+            &run_id,
+            "cancel-projection",
+            &anyhow::anyhow!("stale driver error"),
+        );
+
+        assert!(matches!(projected, SopRunAction::Cancelled { .. }));
     }
 
     #[derive(Default)]

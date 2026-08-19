@@ -953,7 +953,9 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
-    /// Routing selected a step whose dependencies are not yet satisfied.
+    /// No immediate execution is available. This covers dependency waits and
+    /// fail-closed lifecycle retries where the canonical run remains active
+    /// until persistence or maintenance reconciles it.
     Pending {
         run_id: String,
         sop_name: String,
