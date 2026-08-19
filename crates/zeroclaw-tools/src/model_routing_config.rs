@@ -12,6 +12,48 @@ use zeroclaw_providers::ProviderDispatch;
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
 
+/// Why a model probe failed.
+///
+/// A local provider-construction failure is not a transient request failure:
+/// nothing was ever sent, and the saved configuration cannot produce a usable
+/// provider on reload. #9592 requires that such a failure cannot pass model
+/// validation, so the two are kept distinct all the way to the operator-visible
+/// `ToolResult` instead of being flattened into one `anyhow::Error` and sorted
+/// by the chat-oriented `is_non_retryable` heuristic.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// The provider could not be built from the effective configuration.
+    Construction(anyhow::Error),
+    /// The provider was built and the ping request itself failed.
+    Request(anyhow::Error),
+}
+
+impl ProbeFailure {
+    fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::Construction(error) | Self::Request(error) => error,
+        }
+    }
+
+    /// True when the new configuration must not be kept.
+    ///
+    /// Construction failures are always fatal. Request failures defer to the
+    /// existing retry classifier, so transient network conditions still keep
+    /// the new config.
+    fn is_fatal(&self) -> bool {
+        match self {
+            Self::Construction(_) => true,
+            Self::Request(error) => zeroclaw_providers::reliable::is_non_retryable(error),
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error())
+    }
+}
+
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
@@ -613,30 +655,45 @@ impl ModelRoutingConfigTool {
         if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&cfg, &provider_name, &model_name).await
         {
-            if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
+            if probe_err.is_fatal() {
                 let reverted_model = previous_provider_entry
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                if let Some(prev_entry) = previous_provider_entry
-                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
-                {
-                    *slot = prev_entry;
-                }
+                // Restore the previous entry when there was one. When there
+                // was not, this `set_default` call is what created the alias,
+                // so leaving it behind would persist an alias that just failed
+                // validation — and report `Reverted to '(none)'` while doing
+                // it. Remove it instead, so the rollback claim holds for a
+                // newly added alias as well.
+                let reverted_to = match previous_provider_entry {
+                    Some(prev_entry) => {
+                        if let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k) {
+                            *slot = prev_entry;
+                        }
+                        format!("Reverted to '{reverted_model}'.")
+                    }
+                    None => {
+                        cfg.providers.models.remove_alias(&type_k, &alias_k);
+                        format!("Removed the newly created '{provider_name}' alias.")
+                    }
+                };
                 cfg.save().await?;
 
                 return Ok(ToolResult {
                     success: false,
                     output: format!(
-                        "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ).into(),
-                    error: None,
+                        "Model '{model_name}' is not available: {probe_err}. {reverted_to}"
+                    )
+                    .into(),
+                    error: Some(probe_err.to_string()),
                 });
             }
-            // Retryable errors (e.g. transient network issues) — keep the
-            // new config and let the resilient wrapper handle retries.
+            // Retryable request errors (e.g. transient network issues) — keep
+            // the new config and let the resilient wrapper handle retries.
+            // Construction failures never reach here; they are fatal above.
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model": model_name, "probe_err": probe_err.to_string()})), "Model probe returned retryable error (keeping new config)");
         }
 
@@ -651,66 +708,82 @@ impl ModelRoutingConfigTool {
         })
     }
 
+    /// Build the configuration the probe validates against, using the same
+    /// precedence a post-save reload applies.
+    ///
     /// `cfg` was just loaded via `load_config_without_env`, which parses the
     /// on-disk TOML as-is and never decrypts `#[secret]` fields — so any
     /// persisted API key is still `enc2:`-ciphertext at this point, exactly
-    /// as `save()` last wrote it. Build a private, decrypted working copy for
-    /// the probe to read credentials from; the caller's `cfg` (and what
-    /// ultimately reaches disk) is untouched.
-    fn decrypt_for_probe(cfg: &Config) -> anyhow::Result<Config> {
-        let mut decrypted = cfg.clone();
-        let zeroclaw_dir = decrypted
+    /// as `save()` last wrote it. `load_or_init` decrypts and *then* applies
+    /// the `ZEROCLAW_*` override layer, which is the final in-memory
+    /// authority (see `docs/book/src/reference/env-vars.md`, persistence
+    /// boundary). Reproducing only the decrypt half would validate the model
+    /// against whatever is on disk while the reloaded runtime uses the
+    /// environment values — the probe could then authenticate against the
+    /// wrong account, or send an environment-provided credential to the
+    /// stored URI rather than the effective one. Overrides also reach sibling
+    /// fields the probe depends on (`uri`, OAuth material, headers, timeouts,
+    /// and every runtime option resolved by
+    /// `provider_runtime_options_for_alias`), so the layer is applied whole
+    /// rather than field by field.
+    ///
+    /// This is a private working copy; the caller's `cfg` — and therefore
+    /// what reaches disk — is untouched.
+    fn effective_config_for_probe(cfg: &Config) -> anyhow::Result<Config> {
+        let mut effective = cfg.clone();
+        let zeroclaw_dir = effective
             .config_path
             .parent()
             .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| decrypted.config_path.clone());
+            .unwrap_or_else(|| effective.config_path.clone());
         let store =
-            zeroclaw_config::security::SecretStore::new(&zeroclaw_dir, decrypted.secrets.encrypt);
-        decrypted.decrypt_secrets(&store)?;
-        Ok(decrypted)
+            zeroclaw_config::security::SecretStore::new(&zeroclaw_dir, effective.secrets.encrypt);
+        effective.decrypt_secrets(&store)?;
+        let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut effective)?;
+        effective.env_overridden_paths = applied.paths;
+        effective.pre_override_snapshots = applied.snapshots;
+        Ok(effective)
     }
 
     /// Send a minimal 1-token chat request to verify the model is accessible.
-    /// Returns `Ok(())` if the probe succeeds **or** if no API key is configured
-    /// on the saved alias (checking the runtime snapshot too — see below), or
-    /// the saved config's secrets cannot be decrypted (either way the probe
-    /// would fail with an auth error unrelated to model validity, and an
-    /// operator may be configuring the alias while offline). A failure to
-    /// construct the model_provider is surfaced as an `Err` like any other
-    /// probe failure, rather than treated as a passing probe.
+    /// Returns `Ok(())` if the probe succeeds **or** if no API key resolves for
+    /// the saved alias (checking the runtime snapshot too — see below), or the
+    /// saved config's secrets cannot be decrypted (either way the probe would
+    /// fail with an auth error unrelated to model validity, and an operator may
+    /// be configuring the alias while offline). A failure to construct the
+    /// model_provider is surfaced as an `Err` like any other probe failure,
+    /// rather than treated as a passing probe.
+    ///
+    /// Errors are classified via [`ProbeFailure`] so the caller can tell a
+    /// local construction failure from a request failure.
     async fn probe_model(
         &self,
         cfg: &Config,
         provider_name: &str,
         model: &str,
-    ) -> anyhow::Result<()> {
-        // Resolve alias identity, endpoint, and auth options from the config
-        // that was just saved, not the pre-update runtime snapshot, so the
-        // probe validates what is actually on disk.
-        let Ok(mut decrypted) = Self::decrypt_for_probe(cfg) else {
+    ) -> Result<(), ProbeFailure> {
+        // Resolve alias identity, endpoint, credentials, and runtime options
+        // from the effective post-reload view of what was just saved — disk
+        // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
+        // from the pre-update runtime snapshot or from disk alone.
+        let Ok(mut effective) = Self::effective_config_for_probe(cfg) else {
             return Ok(());
         };
         let (family, alias) = provider_name
             .split_once('.')
             .unwrap_or((provider_name, "default"));
 
-        // The credential itself needs a wider net: `load_config_without_env`
-        // (the source of `cfg`) never applies `ZEROCLAW_*` env-var bridges,
-        // so an alias whose key comes purely from the environment - the
-        // common posture in containers and CI - has no key in the saved
-        // config even though it works fine at real request time. Prefer the
-        // just-saved key when present (an operator who wrote a new key must
-        // be probed against the new one, not a stale env-sourced one), but
-        // fall back to `self.config` - the runtime snapshot, which already
-        // went through `load_or_init`'s decrypt + env-override pass, so it
-        // is used as-is and never re-decrypted here.
-        let saved_key = decrypted
+        // `effective` already carries any env-sourced credential for this
+        // alias, so it is the authority. The runtime snapshot remains a
+        // fallback for a key this process resolved at boot through a path the
+        // override layer cannot reproduce here.
+        let effective_key = effective
             .providers
             .models
             .find(family, alias)
             .and_then(|e| e.api_key.clone())
             .filter(|key| !key.trim().is_empty());
-        let api_key = match saved_key {
+        let api_key = match effective_key {
             Some(key) => Some(key),
             None => self
                 .config
@@ -727,12 +800,13 @@ impl ModelRoutingConfigTool {
         // Carry the resolved key on the config handed to the factory so
         // alias-specific credentials resolve correctly regardless of which
         // config they came from.
-        if let Some(entry) = decrypted.providers.models.ensure(family, alias) {
+        if let Some(entry) = effective.providers.models.ensure(family, alias) {
             entry.api_key = Some(api_key);
         }
 
         let model_provider =
-            zeroclaw_providers::create_model_provider_from_ref(&decrypted, provider_name)?;
+            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name)
+                .map_err(ProbeFailure::Construction)?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -743,7 +817,8 @@ impl ModelRoutingConfigTool {
                 model,
                 Some(PING_TEMPERATURE),
             )
-            .await?;
+            .await
+            .map_err(ProbeFailure::Request)?;
 
         Ok(())
     }
@@ -1626,16 +1701,89 @@ mod tests {
         );
     }
 
+    /// `set_default` can create the alias it then probes. On a fatal probe the
+    /// rollback must remove that alias: restoring "the previous entry" is a
+    /// no-op when there was none, which would persist an alias that just
+    /// failed validation while reporting `Reverted to '(none)'`.
     #[tokio::test]
-    async fn set_default_keeps_config_when_probe_construction_error_is_not_fatal() {
+    async fn set_default_fails_and_removes_a_newly_created_alias_on_construction_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+
+        // The credential reaches the probe through the runtime-snapshot
+        // fallback — the container/CI posture where the key is environmental
+        // and never written to disk. It is anthropic-shaped on purpose so
+        // provider construction fails locally, with no network request.
+        let base = test_config(&tmp).await;
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "fresh_alias")
+            .unwrap()
+            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        // Nothing for this alias exists on disk, so the call below is what
+        // creates it.
+        assert!(
+            read_saved_provider_entry(&cfg_path, "openai", "fresh_alias").is_none(),
+            "precondition: the alias must not exist before set_default creates it"
+        );
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.fresh_alias",
+                "model": "gpt-test-model"
+            }))
+            .await
+            .unwrap();
+
+        // Nothing was ever sent and the saved config cannot build a usable
+        // provider on reload, so this cannot be reported as a successful
+        // update (#9592).
+        assert!(
+            !result.success,
+            "a provider-construction failure must not pass model validation: {result:?}"
+        );
+        let output = result.output.to_string();
+        assert!(
+            output.contains("API key prefix mismatch"),
+            "the operator-visible result must name the construction failure: {output}"
+        );
+        assert!(
+            result.error.is_some(),
+            "an unsuccessful probe result must carry the error field"
+        );
+        assert!(
+            output.contains("Removed the newly created"),
+            "the result must state that the new alias was removed, not that it reverted to \
+             '(none)': {output}"
+        );
+
+        // Outer boundary: the failed alias must be absent from what was
+        // persisted, not merely absent from the in-memory config.
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", "fresh_alias");
+        assert!(
+            persisted.is_none(),
+            "a newly created alias must be absent from the persisted config after a failed \
+             probe, got {persisted:?}"
+        );
+    }
+
+    /// The sibling case: when the alias already existed, rollback still
+    /// restores the previous entry rather than removing it.
+    #[tokio::test]
+    async fn set_default_restores_the_previous_entry_on_construction_error() {
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
-        // Seed a real (but provider-mismatched) credential onto the
-        // openai.default alias through a separate write, so the tool's own
-        // runtime snapshot never observes it - mirroring the "saved config
-        // the process hasn't seen yet" scenario the probe must read from.
+        // Seed a real (but provider-mismatched) credential and model onto the
+        // alias through a separate write, so the tool's own runtime snapshot
+        // never observes it — mirroring the "saved config the process hasn't
+        // seen yet" scenario the probe must read from.
         let seed = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -1647,6 +1795,8 @@ mod tests {
             .await
             .unwrap();
         assert!(seed.success, "{:?}", seed.error);
+        let before = read_saved_provider_entry(&cfg_path, "openai", "default")
+            .expect("precondition: the alias must exist before set_default updates it");
 
         let result = tool
             .execute(json!({
@@ -1657,14 +1807,144 @@ mod tests {
             .await
             .unwrap();
 
-        // The probe now genuinely attempts construction and observes the
-        // credential mismatch, but that class of error is not classified as
-        // fatal by the existing retry/rollback heuristic, so a genuinely
-        // non-fatal probe outcome must still keep the newly saved model
-        // rather than roll it back.
-        assert!(result.success, "{:?}", result.error);
-        let entry = read_saved_provider_entry(&cfg_path, "openai", "default")
-            .expect("set_default must materialize the openai.default slot");
-        assert_eq!(entry.model.as_deref(), Some("gpt-test-model"));
+        assert!(
+            !result.success,
+            "a provider-construction failure must not pass model validation: {result:?}"
+        );
+        let after = read_saved_provider_entry(&cfg_path, "openai", "default")
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(
+            after.model, before.model,
+            "rollback must restore the previous model, not keep the failed one"
+        );
+        assert_ne!(after.model.as_deref(), Some("gpt-test-model"));
+    }
+
+    /// Environment overrides are the final in-memory authority after
+    /// decryption, so the probe must be built from the same effective
+    /// configuration a post-save reload produces — not from the disk values
+    /// alone. `set_default` never writes an API key, so when a disk key and a
+    /// `ZEROCLAW_*` key both exist, the runtime will use the environment key
+    /// while the disk key is merely what `load_config_without_env` parsed.
+    ///
+    /// Probing the disk key would validate against the wrong account, and
+    /// probing the disk `uri` would send an environment-provided credential to
+    /// the wrong endpoint.
+    #[tokio::test]
+    async fn probe_model_prefers_env_overridden_credential_and_endpoint_over_disk() {
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // A test-owned alias, so the process-wide env vars below cannot
+        // collide with another test's alias.
+        const ALIAS: &str = "probe_env_case";
+
+        // Disk carries a well-formed openai key. Alone, it would construct
+        // successfully and reach the network. No `uri` here: a custom endpoint
+        // disables the provider factory's key-prefix pre-flight, which is the
+        // no-network signal phase 1 relies on.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-disk-key".to_string());
+        }
+
+        // Phase 1 — the credential the probe actually uses. Only the key is
+        // overridden here: the disk key is well-formed openai and would
+        // construct cleanly, while the env key is anthropic-shaped, so
+        // construction failing is observable proof of which layer was read,
+        // with no network request.
+        let key_var = "ZEROCLAW_providers__models__openai__probe_env_case__api_key";
+        // SAFETY: this test owns this env-var key and removes it before the
+        // next phase. The value is synthetic, not a credential.
+        unsafe { std::env::set_var(key_var, "sk-ant-env-key") };
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        let probe = tool
+            .probe_model(&saved, &format!("openai.{ALIAS}"), "gpt-test")
+            .await;
+
+        // SAFETY: undo the test-only process env mutation above.
+        unsafe { std::env::remove_var(key_var) };
+
+        let failure = probe.expect_err(
+            "the env-overridden anthropic-shaped key must reach provider construction; the \
+             disk key would have constructed cleanly",
+        );
+        assert!(
+            matches!(failure, ProbeFailure::Construction(_)),
+            "an unusable effective credential is a construction failure, not a request failure"
+        );
+        assert!(
+            failure.to_string().contains("API key prefix mismatch"),
+            "the probe must receive the runtime-effective credential: {failure}"
+        );
+
+        // Phase 2 — the sibling fields. Overriding the endpoint too, and
+        // inspecting the effective config the probe builds from, proves the
+        // whole override layer is applied rather than the credential alone.
+        // This phase is pure config resolution; nothing is dispatched.
+        let uri_var = "ZEROCLAW_providers__models__openai__probe_env_case__uri";
+        // SAFETY: this test owns these env-var keys and removes them below.
+        unsafe {
+            std::env::set_var(key_var, "sk-ant-env-key");
+            std::env::set_var(uri_var, "https://env.invalid/v1");
+        }
+
+        let effective = ModelRoutingConfigTool::effective_config_for_probe(&saved);
+
+        // SAFETY: undo the test-only process env mutations above.
+        unsafe {
+            std::env::remove_var(key_var);
+            std::env::remove_var(uri_var);
+        }
+
+        let effective = effective.expect("effective config must build");
+        let entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the alias must survive the override layer");
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("sk-ant-env-key"),
+            "credential must come from the environment layer"
+        );
+        assert_eq!(
+            entry.uri.as_deref(),
+            Some("https://env.invalid/v1"),
+            "endpoint must come from the environment layer, or a credential could be sent to the \
+             wrong host"
+        );
+        assert_eq!(
+            zeroclaw_providers::provider_runtime_options_for_alias(&effective, "openai", ALIAS)
+                .provider_api_url
+                .as_deref(),
+            Some("https://env.invalid/v1"),
+            "the representative runtime option resolved for the probe must also be \
+             environment-effective"
+        );
+    }
+
+    /// A request failure that the retry classifier calls transient must still
+    /// keep the new config — the construction/request split must not turn
+    /// every probe failure into a rollback.
+    #[tokio::test]
+    async fn probe_failure_is_fatal_only_for_construction_and_non_retryable_requests() {
+        assert!(
+            ProbeFailure::Construction(anyhow::Error::msg("API key prefix mismatch")).is_fatal(),
+            "a local construction failure is never transient"
+        );
+        assert!(
+            !ProbeFailure::Request(anyhow::Error::msg(
+                "error sending request: connection reset"
+            ))
+            .is_fatal(),
+            "a transient request failure must keep the new config"
+        );
+        assert!(
+            ProbeFailure::Request(anyhow::Error::msg("404 model not found")).is_fatal(),
+            "a non-retryable request failure must still roll back"
+        );
     }
 }
