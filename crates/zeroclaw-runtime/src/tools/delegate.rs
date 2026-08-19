@@ -1668,9 +1668,14 @@ impl DelegateTool {
                     }
                 };
 
+                // Both branches above observe the same token. Under parallel scheduling the
+                // inner agent loop can return its cancellation error before `select!` chooses
+                // the explicit cancellation branch, so derive the terminal state from the
+                // token rather than the wording or capitalization of that error.
+                let cancellation_observed = child_token.is_cancelled();
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
+                    Ok(output) if !cancellation_observed => BackgroundDelegateResult {
                         task_id: task_id_clone.clone(),
                         agent: agent_name_owned,
                         status: BackgroundTaskStatus::Completed,
@@ -1679,8 +1684,17 @@ impl DelegateTool {
                         started_at,
                         finished_at: Some(finished_at),
                     },
+                    Ok(_) => BackgroundDelegateResult {
+                        task_id: task_id_clone.clone(),
+                        agent: agent_name_owned,
+                        status: BackgroundTaskStatus::Cancelled,
+                        output: None,
+                        error: Some("Cancelled by parent session".to_string()),
+                        started_at,
+                        finished_at: Some(finished_at),
+                    },
                     Err(err) => {
-                        let status = if err.contains("Cancelled") {
+                        let status = if cancellation_observed || err.contains("Cancelled") {
                             BackgroundTaskStatus::Cancelled
                         } else {
                             BackgroundTaskStatus::Failed
