@@ -3065,42 +3065,46 @@ async fn process_whatsapp_message(
         Err(refusal) => return refusal.into_response(&webhook_ingress::WHATSAPP_WEBHOOK),
     };
 
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(verified.body()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let mut verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(wa.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
     };
-
-    // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut dispatchable = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
-        {
-            let mut map = wa.pending_approvals().lock().await;
-            if let Some(sender) = map.remove(&token) {
-                let _ = sender.send(response);
-                continue;
-            }
-        }
-        dispatchable.push(msg);
-    }
+    let mut approvals = wa.pending_approvals().lock().await;
+    verified.retain(|msg| {
+        let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
+        else {
+            return true;
+        };
+        let Some(sender) = approvals.remove(&token) else {
+            return true;
+        };
+        let _ = sender.send(response);
+        false
+    });
+    drop(approvals);
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
         state,
         verified,
-        dispatchable,
         webhook_ingress::WebhookDispatchContext {
             channel,
             memory_key: whatsapp_memory_key,
             agent_override: None,
             mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
         },
     )
     .await
@@ -3185,18 +3189,20 @@ async fn process_linq_webhook(
         Err(refusal) => return refusal.into_response(&webhook_ingress::LINQ_WEBHOOK),
     };
 
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(verified.body()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(linq.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
     };
 
-    // Parse messages from the webhook payload
-    let messages = linq.parse_webhook_payload(&payload);
-
-    if messages.is_empty() {
+    if verified.is_empty() {
         // Acknowledge status/delivery events before ownership resolution.
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
@@ -3230,12 +3236,13 @@ async fn process_linq_webhook(
     webhook_ingress::dispatch_verified_webhook(
         state,
         verified,
-        messages,
         webhook_ingress::WebhookDispatchContext {
             channel,
             memory_key: linq_memory_key,
             agent_override,
             mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
         },
     )
     .await
@@ -3322,16 +3329,20 @@ async fn process_nextcloud_talk_webhook(
         Err(refusal) => return refusal.into_response(&webhook_ingress::NEXTCLOUD_TALK_WEBHOOK),
     };
 
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(verified.body()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+            nextcloud_talk.parse_webhook_payload(&payload),
+        )
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
     };
-
-    // Parse messages from webhook payload
-    let messages = nextcloud_talk.parse_webhook_payload(&payload);
 
     // Fast-ack: Nextcloud Talk cancels webhook requests that don't complete
     // within ~5s and slow local models routinely exceed that, so processing
@@ -3340,12 +3351,13 @@ async fn process_nextcloud_talk_webhook(
     webhook_ingress::dispatch_verified_webhook(
         state,
         verified,
-        messages,
         webhook_ingress::WebhookDispatchContext {
             channel,
             memory_key: nextcloud_talk_memory_key,
             agent_override: None,
             mode: webhook_ingress::WebhookDispatchMode::FastAck,
+            #[cfg(test)]
+            suppress_reply_send: true,
         },
     )
     .await
@@ -7946,6 +7958,15 @@ mod tests {
             Ok(verified) => verified,
             Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
         };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message(
+                    "+15551234567",
+                    "hello lifecycle",
+                )])
+            })
+            .expect("verified request should parse");
 
         let channel_impl = Arc::new(CapturingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -7953,12 +7974,12 @@ mod tests {
         let (status, _body) = webhook_ingress::dispatch_verified_webhook(
             &state,
             verified,
-            vec![test_channel_message("+15551234567", "hello lifecycle")],
             webhook_ingress::WebhookDispatchContext {
                 channel,
                 memory_key: linq_memory_key,
                 agent_override: None,
                 mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
             },
         )
         .await;
@@ -7997,6 +8018,12 @@ mod tests {
             Ok(verified) => verified,
             Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
         };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message("+15551234567", "anyone home?")])
+            })
+            .expect("verified request should parse");
 
         let channel_impl = Arc::new(CapturingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -8004,12 +8031,12 @@ mod tests {
         let (status, _body) = webhook_ingress::dispatch_verified_webhook(
             &state,
             verified,
-            vec![test_channel_message("+15551234567", "anyone home?")],
             webhook_ingress::WebhookDispatchContext {
                 channel,
                 memory_key: linq_memory_key,
                 agent_override: None,
                 mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
             },
         )
         .await;

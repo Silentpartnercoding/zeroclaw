@@ -129,12 +129,14 @@ authenticated-ingress contract:
   header format stay with the transport handler, as a closure that runs only
   after the credential resolves;
 - a successful check mints a `VerifiedWebhookIngress` proof that carries the
-  verified bytes. The proof cannot be constructed or cloned elsewhere;
+  verified bytes. Consuming `parse_messages` gives the parser those exact bytes
+  and returns a private `VerifiedWebhookMessages` value. Neither proof can be
+  constructed or cloned elsewhere;
 - `dispatch_verified_webhook` is the shared gateway-webhook helper for the
   current inbound log, session key, autosave, agent dispatch, quickstart
   fallback, reply/error delivery, and synchronous or fast-ack execution. It
-  consumes the proof, so webhook content cannot enter agent dispatch without
-  a verification result for the same request.
+  consumes the parsed proof, so webhook content cannot enter agent dispatch
+  without a verification result and parsing step bound to the same request.
 
 That helper removes the duplicated gateway `parse -> autosave -> chat -> send`
 chains and gives authenticated ingress one enforced chokepoint. It still calls

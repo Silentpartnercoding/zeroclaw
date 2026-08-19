@@ -9,7 +9,9 @@
 //!
 //! - [`VerifiedWebhookIngress`] is an unforgeable proof value. Its fields are
 //!   private, it implements neither `Clone` nor `Default`, and the only way to
-//!   obtain one is a successful [`authenticate`] call.
+//!   obtain one is a successful [`authenticate`] call. Its
+//!   [`VerifiedWebhookIngress::parse_messages`] method gives the parser the
+//!   exact verified bytes and returns the only value accepted by dispatch.
 //! - [`authenticate`] owns the fail-closed credential policy: a missing,
 //!   blank, or unresolvable required credential refuses the request before
 //!   any payload byte is parsed. The provider-specific signature algorithm
@@ -18,10 +20,10 @@
 //!   will carry.
 //! - [`dispatch_verified_webhook`] is the shared gateway-webhook helper for
 //!   the current inbound log, session key, autosave, agent chat, and
-//!   reply/error-delivery path. It consumes the proof, so a webhook message
-//!   cannot enter agent dispatch without a successful verification result for
-//!   the same request body. It remains an intermediate boundary until gateway
-//!   webhooks enter the shared channel turn lifecycle.
+//!   reply/error-delivery path. It consumes the parsed proof, so messages
+//!   cannot be supplied independently of a successfully verified request. It
+//!   remains an intermediate boundary until gateway webhooks enter the shared
+//!   channel turn lifecycle.
 //! - [`MESSAGE_DISPATCHING_WEBHOOKS`] is the canonical registry of every
 //!   message-dispatching webhook adapter and its authentication mode.
 //!   [`authenticate`] refuses specs that are not registered, and the drift
@@ -303,10 +305,9 @@ fn log_refusal(
 }
 
 /// Proof that one inbound webhook request passed its adapter's required
-/// verification. Carries the exact bytes that were verified so the handler
-/// parses what was authenticated, not a second copy. Cannot be constructed
-/// outside this module, cannot be cloned, and is consumed by
-/// [`dispatch_verified_webhook`], so one proof feeds at most one dispatch.
+/// verification. Carries the exact bytes that were verified and can mint a
+/// dispatch value only by parsing those bytes. Cannot be constructed or
+/// cloned outside this module.
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
@@ -324,10 +325,54 @@ pub(crate) struct VerifiedWebhookIngress {
     feature = "channel-whatsapp-cloud"
 ))]
 impl VerifiedWebhookIngress {
-    /// The verified request body. Parse payloads from this, never from a
-    /// separately retained copy of the request.
-    pub(crate) fn body(&self) -> &[u8] {
-        &self.body
+    /// Parse the exact verified bytes into normalized messages. Consuming the
+    /// proof and keeping the resulting fields private prevents dispatch from
+    /// accepting a separately supplied message vector.
+    pub(crate) fn parse_messages<E>(
+        self,
+        parse: impl FnOnce(&[u8]) -> Result<Vec<ChannelMessage>, E>,
+    ) -> Result<VerifiedWebhookMessages, E> {
+        let Self { spec, alias, body } = self;
+        let messages = parse(&body)?;
+        Ok(VerifiedWebhookMessages {
+            spec,
+            alias,
+            messages,
+        })
+    }
+}
+
+/// Normalized messages derived from one verified webhook body. Only
+/// [`VerifiedWebhookIngress::parse_messages`] can construct this value, and
+/// the dispatch helper consumes it.
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+pub(crate) struct VerifiedWebhookMessages {
+    spec: &'static WebhookAdapterSpec,
+    alias: String,
+    messages: Vec<ChannelMessage>,
+}
+
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+impl VerifiedWebhookMessages {
+    #[cfg(feature = "channel-linq")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Remove messages handled entirely by the transport adapter, such as
+    /// WhatsApp approval replies. This can narrow the parsed set but cannot
+    /// introduce content that did not come from the verified body.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&ChannelMessage) -> bool) {
+        self.messages.retain(keep);
     }
 }
 
@@ -433,16 +478,21 @@ pub(crate) struct WebhookDispatchContext {
     pub(crate) agent_override: Option<String>,
     /// Response-blocking behavior.
     pub(crate) mode: WebhookDispatchMode,
+    /// Handler tests exercise auth, parsing, and dispatch without contacting
+    /// provider APIs. Shared lifecycle tests leave this false and assert
+    /// delivery through a capturing channel.
+    #[cfg(test)]
+    pub(crate) suppress_reply_send: bool,
 }
 
 /// The shared gateway-webhook dispatch helper: inbound log, session key,
 /// autosave, agent chat, reply delivery, and quickstart/error fallback.
 ///
-/// Consuming [`VerifiedWebhookIngress`] is the contract: this is the only
-/// path from a channel webhook into gateway agent chat, and it is
-/// unreachable without a successful [`authenticate`] result for the request.
-/// This helper still uses the gateway chat path; it does not replace the
-/// shared channel turn lifecycle.
+/// Consuming [`VerifiedWebhookMessages`] is the contract: this is the only
+/// path from a channel webhook into gateway agent chat, and the value is
+/// unreachable without a successful [`authenticate`] result followed by
+/// parsing the verified bytes. This helper still uses the gateway chat path;
+/// it does not replace the shared channel turn lifecycle.
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
@@ -450,11 +500,14 @@ pub(crate) struct WebhookDispatchContext {
 ))]
 pub(crate) async fn dispatch_verified_webhook(
     state: &AppState,
-    ingress: VerifiedWebhookIngress,
-    messages: Vec<ChannelMessage>,
+    ingress: VerifiedWebhookMessages,
     ctx: WebhookDispatchContext,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let VerifiedWebhookIngress { spec, alias, .. } = ingress;
+    let VerifiedWebhookMessages {
+        spec,
+        alias,
+        messages,
+    } = ingress;
 
     match ctx.mode {
         #[cfg(any(feature = "channel-linq", feature = "channel-whatsapp-cloud"))]
@@ -467,6 +520,8 @@ pub(crate) async fn dispatch_verified_webhook(
                     ctx.channel.as_ref(),
                     ctx.memory_key,
                     ctx.agent_override.as_deref(),
+                    #[cfg(test)]
+                    ctx.suppress_reply_send,
                     msg,
                 )
                 .await;
@@ -484,6 +539,8 @@ pub(crate) async fn dispatch_verified_webhook(
                 let alias = alias.clone();
                 let agent_override = ctx.agent_override.clone();
                 let memory_key = ctx.memory_key;
+                #[cfg(test)]
+                let suppress_reply_send = ctx.suppress_reply_send;
                 zeroclaw_spawn::spawn!(async move {
                     process_verified_message(
                         &state,
@@ -492,6 +549,8 @@ pub(crate) async fn dispatch_verified_webhook(
                         channel.as_ref(),
                         memory_key,
                         agent_override.as_deref(),
+                        #[cfg(test)]
+                        suppress_reply_send,
                         &msg,
                     )
                     .await;
@@ -516,6 +575,7 @@ async fn process_verified_message(
     channel: &dyn Channel,
     memory_key: fn(&ChannelMessage) -> String,
     agent_override: Option<&str>,
+    #[cfg(test)] suppress_reply_send: bool,
     msg: &ChannelMessage,
 ) {
     ::zeroclaw_log::record!(
@@ -566,6 +626,10 @@ async fn process_verified_message(
     .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
+            #[cfg(test)]
+            if suppress_reply_send {
+                return;
+            }
             if let Err(e) = channel
                 .send(&SendMessage::new(response, &msg.reply_target))
                 .await
@@ -607,6 +671,10 @@ async fn process_verified_message(
                 );
                 "Sorry, I couldn't process your message right now.".to_string()
             };
+            #[cfg(test)]
+            if suppress_reply_send {
+                return;
+            }
             let _ = channel
                 .send(&SendMessage::new(reply, &msg.reply_target))
                 .await;
@@ -710,11 +778,17 @@ mod tests {
         )
         .expect("verification succeeded");
         assert_eq!(observed.get(), body.len());
-        assert_eq!(
-            verified.body(),
-            body.as_ref(),
-            "the proof must carry exactly the bytes the verifier saw"
-        );
+        let parsed = verified
+            .parse_messages(|bytes| {
+                assert_eq!(
+                    bytes,
+                    body.as_ref(),
+                    "the parser must receive exactly the bytes the verifier saw"
+                );
+                Ok::<_, ()>(Vec::new())
+            })
+            .expect("verified bytes should parse");
+        assert!(parsed.is_empty());
     }
 
     #[test]
@@ -767,16 +841,19 @@ mod tests {
     /// messages and therefore sit outside the authenticated-ingress
     /// contract. Every entry needs a reason a reviewer can check.
     const NON_DISPATCHING_WEBHOOK_ROUTES: &[(&str, &str, &str)] = &[
+        #[cfg(feature = "channel-whatsapp-cloud")]
         (
             "/whatsapp",
             "get",
             "Meta webhook verification challenge echo; dispatches nothing",
         ),
+        #[cfg(feature = "channel-whatsapp-cloud")]
         (
             "/whatsapp/{alias}",
             "get",
             "Meta webhook verification challenge echo; dispatches nothing",
         ),
+        #[cfg(feature = "channel-email")]
         (
             "/webhook/gmail",
             "post",
@@ -817,6 +894,65 @@ mod tests {
         routes
     }
 
+    /// Whether one Cargo feature used by `optional_channel_routes` is active
+    /// in this test build. Keeping this mapping separate from route paths lets
+    /// the source scanner honor the route table's own `#[cfg]` ownership
+    /// without introducing a second route inventory.
+    fn optional_route_feature_enabled(feature: &str) -> bool {
+        match feature {
+            "channel-whatsapp-cloud" => cfg!(feature = "channel-whatsapp-cloud"),
+            "channel-linq" => cfg!(feature = "channel-linq"),
+            "channel-nextcloud" => cfg!(feature = "channel-nextcloud"),
+            "channel-email" => cfg!(feature = "channel-email"),
+            other => panic!(
+                "optional_channel_routes uses unrecognized feature {other:?}; \
+                 teach the drift-guard source scanner how to evaluate it"
+            ),
+        }
+    }
+
+    /// Materialize only the route statements enabled in this feature build.
+    /// Each `#[cfg(feature = "...")]` in `optional_channel_routes` owns the
+    /// following `let router = ...;` statement.
+    fn active_optional_route_source(region: &str) -> String {
+        const CFG_PREFIX: &str = "#[cfg(feature = \"";
+        const CFG_SUFFIX: &str = "\")]";
+
+        let mut active = true;
+        let mut inside_cfg_statement = false;
+        let mut source = String::new();
+        for line in region.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#[cfg(") {
+                let feature = trimmed
+                    .strip_prefix(CFG_PREFIX)
+                    .and_then(|value| value.strip_suffix(CFG_SUFFIX))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "unsupported optional_channel_routes cfg {trimmed:?}; \
+                             keep the drift-guard parser aligned with the route owner"
+                        )
+                    });
+                active = optional_route_feature_enabled(feature);
+                inside_cfg_statement = true;
+                continue;
+            }
+            if active {
+                source.push_str(line);
+                source.push('\n');
+            }
+            if inside_cfg_statement && trimmed.ends_with(';') {
+                active = true;
+                inside_cfg_statement = false;
+            }
+        }
+        assert!(
+            !inside_cfg_statement,
+            "optional_channel_routes ended inside a cfg-gated statement"
+        );
+        source
+    }
+
     #[test]
     fn every_channel_webhook_route_is_classified_by_the_registry() {
         let source = include_str!("lib.rs");
@@ -829,15 +965,16 @@ mod tests {
             .expect("marker after optional_channel_routes moved; update this drift guard");
         let region = &source[start..end];
 
-        let found = parse_routes(region);
+        let all_routes = parse_routes(region);
         // Tripwire on the scanner itself: if parsing breaks, this count
         // collapses and the guard must fail rather than pass vacuously.
         assert!(
-            found.len() >= 9,
+            all_routes.len() >= 9,
             "route scanner found only {} routes in optional_channel_routes; \
              the parser or the source region marker is broken",
-            found.len()
+            all_routes.len()
         );
+        let found = parse_routes(&active_optional_route_source(region));
 
         let mut allowed: Vec<(String, String)> = Vec::new();
         for spec in MESSAGE_DISPATCHING_WEBHOOKS {
