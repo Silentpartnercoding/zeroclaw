@@ -2502,7 +2502,10 @@ impl Agent {
                         .provider_switch_config
                         .as_ref()
                         .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            run_cancellation: None,
+                        }),
                 }),
             ),
         );
@@ -2944,7 +2947,10 @@ impl Agent {
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            .map(|config| crate::agent::turn::SopStepReassembly {
+                                config,
+                                run_cancellation: None,
+                            }),
                     }),
                 ),
             );

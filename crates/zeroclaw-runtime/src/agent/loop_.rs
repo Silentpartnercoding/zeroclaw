@@ -2016,6 +2016,7 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    run_cancellation: run_cancellation.as_ref(),
                                 }),
                             }),
                         ),
@@ -2563,6 +2564,7 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        run_cancellation: run_cancellation.as_ref(),
                                     }),
                                 }),
                             ),
@@ -3391,7 +3393,10 @@ pub async fn process_message(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        run_cancellation: None,
+                    }),
                 ),
             )
             .await
