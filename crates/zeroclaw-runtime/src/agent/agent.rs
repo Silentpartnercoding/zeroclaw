@@ -1593,6 +1593,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter

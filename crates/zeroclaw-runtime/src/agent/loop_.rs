@@ -1386,6 +1386,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            run_cancellation.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2980,6 +2981,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
+            None,
             None,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);

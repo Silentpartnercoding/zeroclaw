@@ -321,6 +321,9 @@ fn owned_worker_result<T>(
     deadline_elapsed: bool,
 ) -> Result<T, OwnedSupervisionError> {
     match result {
+        Ok(OwnedWorkerOutcome::Completed(_)) if deadline_elapsed => {
+            Err(OwnedSupervisionError::DeadlineExceeded)
+        }
         Ok(OwnedWorkerOutcome::Completed(value)) => Ok(value),
         Ok(OwnedWorkerOutcome::CancellationAcknowledged) if deadline_elapsed => {
             Err(OwnedSupervisionError::DeadlineExceeded)
@@ -3584,6 +3587,29 @@ mod tests {
             outcome.expect("work completing inside its deadline must return Ok"),
             "supervised value",
             "the supervised future's value must be propagated to the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervise_owned_rejects_completion_after_deadline() {
+        let outcome = supervise_owned(
+            Duration::from_millis(50),
+            Box::new(|_cancellation| {
+                Box::pin(async {
+                    // One non-yielding poll crosses the deadline and then
+                    // returns a successful value. Once the caller has
+                    // requested cancellation, that late value must not erase
+                    // the wall-clock timeout or make the run retryable.
+                    std::thread::sleep(Duration::from_millis(200));
+                    7_u8
+                })
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(OwnedSupervisionError::DeadlineExceeded)),
+            "a completion observed after cancellation must remain a deadline: {outcome:?}"
         );
     }
 

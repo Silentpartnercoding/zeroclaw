@@ -167,6 +167,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -547,6 +548,7 @@ pub fn all_tools(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -595,6 +597,9 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    // Per-run cancellation owner. Cron supplies its supervised run token so
+    // spawned background and parallel delegates cannot outlive the claim.
+    run_cancellation: Option<CancellationToken>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1497,7 +1502,7 @@ pub fn all_tools_with_runtime(
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
+        let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
             security.clone(),
@@ -1526,6 +1531,9 @@ pub fn all_tools_with_runtime(
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
         .with_caller_alias(agent_alias);
+        if let Some(cancellation) = run_cancellation {
+            delegate_tool = delegate_tool.with_cancellation_token(cancellation);
+        }
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -1929,6 +1937,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2066,6 +2075,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .tools;
             let tool = tools
@@ -2155,6 +2165,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -2218,6 +2229,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2275,6 +2287,7 @@ mod tests {
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -2297,6 +2310,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
             None,
         );
 
@@ -2424,6 +2438,7 @@ mod tests {
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .tools
         };
@@ -2516,6 +2531,7 @@ mod tests {
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -2838,6 +2854,7 @@ mod tests {
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .tools
