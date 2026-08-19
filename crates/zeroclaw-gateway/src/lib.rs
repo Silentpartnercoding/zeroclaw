@@ -8007,6 +8007,7 @@ mod tests {
             passive_context: false,
             explicitly_addressed: false,
             conversation_scope: Default::default(),
+            references: Vec::new(),
         }
     }
 
