@@ -135,13 +135,24 @@ fn load_descriptions(locale: &str) -> HashMap<String, String> {
 }
 
 fn load_cli_strings(locale: &str) -> HashMap<String, String> {
+    let disk = (locale != "en")
+        .then(|| load_ftl_from_disk(locale, "cli.ftl"))
+        .flatten();
+    load_cli_strings_from_sources(locale, builtin_cli_ftl_source(locale), disk.as_deref())
+}
+
+fn load_cli_strings_from_sources(
+    locale: &str,
+    builtin: Option<&str>,
+    disk: Option<&str>,
+) -> HashMap<String, String> {
     let mut map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
     if locale != "en" {
-        if let Some(locale_ftl) = builtin_cli_ftl_source(locale) {
+        if let Some(locale_ftl) = builtin {
             map.extend(format_ftl_messages(locale_ftl, locale));
         }
-        if let Some(locale_ftl) = load_ftl_from_disk(locale, "cli.ftl") {
-            map.extend(format_ftl_messages(&locale_ftl, locale));
+        if let Some(locale_ftl) = disk {
+            map.extend(format_ftl_messages(locale_ftl, locale));
         }
     }
     map
@@ -509,7 +520,28 @@ mod tests {
         // runtime. Keep in sync with TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN.
         const MAX_DESC_CHARS: usize = 100;
 
-        let en_map = load_cli_strings("en");
+        // Read the checked-in sources directly. The runtime loader deliberately
+        // overlays per-user disk catalogs, but those overrides must not be able
+        // to mask a missing or stale translation in the committed catalog.
+        let en_map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
+        let locale_maps = [
+            (
+                "es",
+                format_ftl_messages(include_str!("../locales/es/cli.ftl"), "es"),
+            ),
+            (
+                "fr",
+                format_ftl_messages(include_str!("../locales/fr/cli.ftl"), "fr"),
+            ),
+            (
+                "ja",
+                format_ftl_messages(include_str!("../locales/ja/cli.ftl"), "ja"),
+            ),
+            (
+                "zh-CN",
+                format_ftl_messages(include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ),
+        ];
         for (key, expected_en) in keys {
             let en_value = en_map
                 .get(key)
@@ -532,8 +564,7 @@ mod tests {
                 en_value.chars().count()
             );
 
-            for locale in ["es", "fr", "ja", "zh-CN"] {
-                let map = load_cli_strings(locale);
+            for (locale, map) in &locale_maps {
                 let value = map
                     .get(key)
                     .unwrap_or_else(|| panic!("missing {locale} value for {key}"));
@@ -560,17 +591,16 @@ mod tests {
 
     #[test]
     fn telegram_command_description_falls_back_to_english_when_locale_key_is_missing() {
-        let sources = CliFtlSources {
-            locale: "fr".to_string(),
-            disk: None,
-            // A valid non-English catalog that intentionally omits the key
-            // under test, exercising built-in-locale -> English fallback.
-            builtin: Some(
-                "channel-telegram-cmd-clear-desc = Effacer cette session de conversation",
-            ),
-        };
-
-        let rendered = format_cli_string_with_args(&sources, "channel-telegram-cmd-new-desc", &[])
+        // Exercise the same no-argument map-loading path used by
+        // `get_required_cli_string`, with a valid built-in locale catalog that
+        // intentionally omits the key under test.
+        let map = load_cli_strings_from_sources(
+            "fr",
+            Some("channel-telegram-cmd-clear-desc = Effacer cette session de conversation"),
+            None,
+        );
+        let rendered = map
+            .get("channel-telegram-cmd-new-desc")
             .expect("missing French command description should fall back to English");
 
         assert_eq!(rendered, "Start a new conversation session");

@@ -7747,17 +7747,25 @@ mod tests {
         // Locale selection is process-global and immutable after its first
         // lookup. Run the ignored helper in a fresh process so `init("fr")`
         // deterministically owns that first lookup without racing unrelated
-        // tests in this binary.
-        let output = std::process::Command::new(
+        // tests in this binary. An isolated config directory also prevents a
+        // developer-installed disk catalog from overriding the committed
+        // French source that this boundary regression is intended to prove.
+        let config_dir = tempfile::tempdir().expect("create isolated locale config directory");
+        let mut command = std::process::Command::new(
             std::env::current_exe().expect("current test executable should be available"),
-        )
-        .args([
-            "register_bot_commands_french_payload_helper",
-            "--ignored",
-            "--nocapture",
-        ])
-        .output()
-        .expect("French command-menu child test should start");
+        );
+        command
+            .args([
+                "register_bot_commands_french_payload_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE");
+        let output = command
+            .output()
+            .expect("French command-menu child test should start");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
