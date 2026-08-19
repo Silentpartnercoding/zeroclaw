@@ -16,8 +16,8 @@ const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
 ///
 /// A local provider-construction failure is not a transient request failure:
 /// nothing was ever sent, and the saved configuration cannot produce a usable
-/// provider on reload. #9592 requires that such a failure cannot pass model
-/// validation, so the two are kept distinct all the way to the operator-visible
+/// provider on reload. The linked issue requires that such a failure cannot pass
+/// model validation, so the two are kept distinct all the way to the operator-visible
 /// `ToolResult` instead of being flattened into one `anyhow::Error` and sorted
 /// by the chat-oriented `is_non_retryable` heuristic.
 #[derive(Debug)]
@@ -1742,7 +1742,7 @@ mod tests {
 
         // Nothing was ever sent and the saved config cannot build a usable
         // provider on reload, so this cannot be reported as a successful
-        // update (#9592).
+        // update.
         assert!(
             !result.success,
             "a provider-construction failure must not pass model validation: {result:?}"
