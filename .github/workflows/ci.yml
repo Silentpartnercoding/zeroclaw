@@ -25,8 +25,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 # ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
-# The seven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test) and the Linux `build` matrix entry pick their runner
+# The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
+# Linux `build` matrix entry pick their runner
 # from a single boolean Actions variable, mapped here to two pinned choices only:
 #   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
 #   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
