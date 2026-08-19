@@ -1508,12 +1508,8 @@ mod tests {
             Some(crate::sop::engine::CancelOutcome::Requested)
         ));
 
-        let projected = project_driver_error(
-            &engine,
-            &run_id,
-            "cancel-projection",
-            &anyhow::anyhow!("terminal write unavailable"),
-        );
+        let driver_error = anyhow::Error::msg("terminal write unavailable");
+        let projected = project_driver_error(&engine, &run_id, "cancel-projection", &driver_error);
 
         assert!(matches!(
             projected,
@@ -1552,12 +1548,8 @@ mod tests {
             .unwrap();
         engine.finish_requested_cancellation(&run_id).unwrap();
 
-        let projected = project_driver_error(
-            &engine,
-            &run_id,
-            "cancel-projection",
-            &anyhow::anyhow!("stale driver error"),
-        );
+        let driver_error = anyhow::Error::msg("stale driver error");
+        let projected = project_driver_error(&engine, &run_id, "cancel-projection", &driver_error);
 
         assert!(matches!(projected, SopRunAction::Cancelled { .. }));
     }
