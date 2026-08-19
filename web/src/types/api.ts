@@ -294,7 +294,7 @@ export interface WsMessage {
   // plumbing) plus the gateway/web surfacing built on top of it.
   requested_model?: string;
   served_model?: string;
-  fallback_kind?: "server" | "client";
+  fallback_kind?: "server" | "client" | "client_server";
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
   input_tokens?: number;

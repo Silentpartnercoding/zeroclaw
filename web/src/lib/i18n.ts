@@ -1447,6 +1447,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.history_trimmed_unknown_reason': 'history limit exceeded',
     'agent.safeguard_fallback_client': '🛡️ Safety safeguards flagged this request — switched to {served} (requested {requested}).',
     'agent.safeguard_fallback_server': '🛡️ Safety safeguards flagged this request — Anthropic served the response with {served} (requested {requested}).',
+    'agent.safeguard_fallback_client_server': '🛡️ Safety safeguards flagged this request — switched through a fallback chain to {served} (requested {requested}).',
     'agent.turn_no_output': 'Turn completed with no output.',
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',

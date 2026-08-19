@@ -6405,46 +6405,21 @@ async fn process_channel_message_body(
                 &msg.channel,
                 &msg.reply_target,
             );
-
             // Append a footer when the response was served by a different model_provider family.
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed. A safeguard
             // (refusal-triggered) notice always wins and is exempt from the same-family gate.
             let generic_same_family = fallback_info.as_ref().is_some_and(|fb| {
                 !fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider)
             });
-            match select_response_footer(
-                fallback_info.as_ref(),
-                generic_same_family,
-                safeguard_notice.as_ref(),
-            ) {
-                FooterChoice::Safeguard(notice) => {
-                    let key = if notice.kind == SafeguardFallbackKind::ServerSide {
-                        "channel-runtime-safeguard-footer-server"
-                    } else {
-                        "channel-runtime-safeguard-footer-client"
-                    };
-                    delivered_response.push_str("\n\n---\n");
-                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                        key,
-                        &[
-                            ("requested", notice.requested_model.as_str()),
-                            ("served", notice.served_model.as_str()),
-                        ],
-                    ));
-                }
-                FooterChoice::Generic(fb) => {
-                    delivered_response.push_str("\n\n---\n");
-                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                        "channel-runtime-fallback-footer",
-                        &[
-                            ("requested", fb.requested_provider.as_str()),
-                            ("actual", fb.actual_provider.as_str()),
-                            ("model", fb.actual_model.as_str()),
-                        ],
-                    ));
-                }
-                FooterChoice::None => {}
-            }
+            let (history_response, decorated_response) = prepare_channel_response_surfaces(
+                delivered_response,
+                select_response_footer(
+                    fallback_info.as_ref(),
+                    generic_same_family,
+                    safeguard_notice.as_ref(),
+                ),
+            );
+            delivered_response = decorated_response;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -6476,7 +6451,6 @@ async fn process_channel_message_body(
                 }
             }
 
-            let history_response = delivered_response.clone();
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
@@ -6493,7 +6467,7 @@ async fn process_channel_message_body(
                 let model = ctx.model.to_string();
                 let temperature = ctx.temperature;
                 let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
+                let assistant_resp = history_response.clone();
                 zeroclaw_spawn::spawn!(async move {
                     if let Err(e) = memory_strategy
                         .consolidate_turn(
@@ -6949,6 +6923,49 @@ fn select_response_footer<'a>(
         Some(fb) if !generic_same_family => FooterChoice::Generic(fb),
         _ => FooterChoice::None,
     }
+}
+
+fn append_response_footer(response: &mut String, footer: FooterChoice<'_>) {
+    match footer {
+        FooterChoice::Safeguard(notice) => {
+            let key = match notice.kind {
+                SafeguardFallbackKind::ServerSide => "channel-runtime-safeguard-footer-server",
+                SafeguardFallbackKind::ClientSide => "channel-runtime-safeguard-footer-client",
+                SafeguardFallbackKind::ClientAndServer => {
+                    "channel-runtime-safeguard-footer-client-server"
+                }
+            };
+            response.push_str("\n\n---\n");
+            response.push_str(&channel_runtime_cli_string_with_args(
+                key,
+                &[
+                    ("requested", notice.requested_model.as_str()),
+                    ("served", notice.served_model.as_str()),
+                ],
+            ));
+        }
+        FooterChoice::Generic(fallback) => {
+            response.push_str("\n\n---\n");
+            response.push_str(&channel_runtime_cli_string_with_args(
+                "channel-runtime-fallback-footer",
+                &[
+                    ("requested", fallback.requested_provider.as_str()),
+                    ("actual", fallback.actual_provider.as_str()),
+                    ("model", fallback.actual_model.as_str()),
+                ],
+            ));
+        }
+        FooterChoice::None => {}
+    }
+}
+
+fn prepare_channel_response_surfaces(
+    canonical_response: String,
+    footer: FooterChoice<'_>,
+) -> (String, String) {
+    let mut delivered_response = canonical_response.clone();
+    append_response_footer(&mut delivered_response, footer);
+    (canonical_response, delivered_response)
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path
@@ -12425,6 +12442,43 @@ mod tests {
     fn no_footers_when_nothing_recorded() {
         let choice = select_response_footer(None, false, None);
         assert!(matches!(choice, FooterChoice::None));
+    }
+
+    #[test]
+    fn safeguard_footer_is_single_and_absent_from_persisted_and_model_visible_history() {
+        let safeguard = sample_safeguard_notice();
+        let (canonical, delivered) = prepare_channel_response_surfaces(
+            "accepted assistant response".to_string(),
+            select_response_footer(None, false, Some(&safeguard)),
+        );
+        let temp = TempDir::new().expect("temp session directory");
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(temp.path()).expect("session backend"));
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            ..(*router_test_ctx()).clone()
+        };
+        let sender = "safeguard-history-boundary";
+        append_sender_turn(&ctx, sender, ChatMessage::assistant(&canonical));
+
+        assert_eq!(canonical, "accepted assistant response");
+        assert_eq!(delivered.matches("🛡️").count(), 1, "footer duplicated");
+        assert!(delivered.contains("claude-opus-4-8"));
+        assert!(!delivered.contains("classifier"));
+
+        let stored = session_store.load(sender);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].content, canonical);
+        assert!(!stored[0].content.contains("🛡️"));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let model_visible = histories.peek(sender).expect("model-visible history");
+        assert_eq!(model_visible.len(), 1);
+        assert_eq!(model_visible[0].content, canonical);
+        assert!(!model_visible[0].content.contains("🛡️"));
     }
 
     #[test]

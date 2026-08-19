@@ -35,9 +35,30 @@ pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
 pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 pub use safeguard_notice::{
-    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
-    scope_safeguard_fallback, take_last_safeguard_fallback,
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
+    peek_last_safeguard_fallback, scope_safeguard_fallback, take_last_safeguard_fallback,
 };
+
+/// Return billed usage carried by a rejected provider result.
+///
+/// Reliable's aggregate is authoritative when present; a leaf refusal's own
+/// usage is the fallback for direct-provider and interrupted-stream paths.
+pub fn rejected_attempt_usage_from_error(error: &anyhow::Error) -> Option<&traits::TokenUsage> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ReliableRejectedCompletionUsage>()
+                .map(|rejected| &rejected.usage)
+        })
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<AnthropicRefusalError>()
+                    .and_then(|refusal| refusal.usage.as_deref())
+            })
+        })
+}
 
 mod request_payload;
 

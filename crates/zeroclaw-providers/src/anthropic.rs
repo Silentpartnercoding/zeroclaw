@@ -9,6 +9,7 @@ use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+pub use zeroclaw_api::model_provider::ModelRefusalError as AnthropicRefusalError;
 use zeroclaw_api::tool::ToolSpec;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
@@ -16,7 +17,7 @@ const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 use crate::safeguard_notice::{
-    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
 /// Anthropic's documented per-image ceiling for the direct API: 10 MB
 /// **base64-encoded**. Measured on the encoded payload length, unlike the
@@ -414,7 +415,7 @@ struct NativeChatResponse {
     stop_details: Option<NativeStopDetails>,
     /// Model that actually served this turn. On a server-side-fallback
     /// response this may differ from the requested model — the primary signal
-    /// read by [`AnthropicModelProvider::detect_server_fallback`].
+    /// read by [`AnthropicModelProvider::server_fallback_notice`].
     #[serde(default)]
     model: Option<String>,
 }
@@ -427,27 +428,9 @@ struct NativeStopDetails {
     category: Option<String>,
 }
 
+#[cfg(test)]
 const ANTHROPIC_REFUSAL_MESSAGE: &str =
     "anthropic refusal: model declined this request (safety classifiers)";
-
-/// A Fable-class safety-classifier refusal: HTTP 200 with
-/// `stop_reason: "refusal"`. Deliberately an error so the reliability layer
-/// treats it as a fallback trigger. Never contains `explanation` text.
-#[derive(Debug, Clone)]
-pub struct AnthropicRefusalError {
-    /// Model asked for on this attempt.
-    pub requested_model: String,
-    /// Refusal category token (`cyber`/`bio`/...), when the API sent one.
-    pub category: Option<String>,
-}
-
-impl std::fmt::Display for AnthropicRefusalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(ANTHROPIC_REFUSAL_MESSAGE)
-    }
-}
-
-impl std::error::Error for AnthropicRefusalError {}
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
@@ -466,7 +449,7 @@ struct AnthropicUsage {
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
     /// Per-attempt breakdown on a server-side-fallback response. Absent on a
-    /// normal turn; read by [`AnthropicModelProvider::detect_server_fallback`]
+    /// normal turn; read by [`AnthropicModelProvider::server_fallback_notice`]
     /// to tell whether a fallback attempt actually served the turn.
     #[serde(default)]
     iterations: Option<Vec<AnthropicUsageIteration>>,
@@ -1897,6 +1880,25 @@ impl AnthropicModelProvider {
         }
     }
 
+    fn normalize_usage(usage: Option<&AnthropicUsage>) -> Option<TokenUsage> {
+        usage.map(|usage| {
+            let uncached = usage.input_tokens.unwrap_or(0);
+            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+            let cache_create = usage.cache_creation_input_tokens.unwrap_or(0);
+            let total = uncached
+                .saturating_add(cache_read)
+                .saturating_add(cache_create);
+            let any_reported = usage.input_tokens.is_some()
+                || usage.cache_read_input_tokens.is_some()
+                || usage.cache_creation_input_tokens.is_some();
+            TokenUsage {
+                input_tokens: if any_reported { Some(total) } else { None },
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cache_read_input_tokens,
+            }
+        })
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
@@ -1905,22 +1907,7 @@ impl AnthropicModelProvider {
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
-        let usage = response.usage.map(|u| {
-            let uncached = u.input_tokens.unwrap_or(0);
-            let cache_read = u.cache_read_input_tokens.unwrap_or(0);
-            let cache_create = u.cache_creation_input_tokens.unwrap_or(0);
-            let total = uncached
-                .saturating_add(cache_read)
-                .saturating_add(cache_create);
-            let any_reported = u.input_tokens.is_some()
-                || u.cache_read_input_tokens.is_some()
-                || u.cache_creation_input_tokens.is_some();
-            TokenUsage {
-                input_tokens: if any_reported { Some(total) } else { None },
-                output_tokens: u.output_tokens,
-                cached_input_tokens: u.cache_read_input_tokens,
-            }
-        });
+        let usage = Self::normalize_usage(response.usage.as_ref());
 
         for block in response.content {
             let kind = block.kind;
@@ -2052,6 +2039,9 @@ impl AnthropicModelProvider {
         Err(AnthropicRefusalError {
             requested_model: requested_model.to_string(),
             category,
+            usage: Self::normalize_usage(response.usage.as_ref()).map(Box::new),
+            attempted_candidate: None,
+            attempted_candidate_index: None,
         })
     }
 
@@ -2063,12 +2053,15 @@ impl AnthropicModelProvider {
     ///
     /// Detection keys only on `usage.iterations` (a `fallback_message` attempt
     /// ran) plus the top-level `model` (who actually served) — never on the
-    /// `fallback` content block, which sticky-routed turns omit. Records at most
-    /// one `ServerSide` notice, and only when the served model is present AND
+    /// `fallback` content block, which sticky-routed turns omit. Returns one
+    /// `ServerSide` notice only when the served model is present AND
     /// differs from the requested one, so a notice never names the requested
     /// model as its own rescue. The notice's `category` is always `None`: the
     /// serving response carries no refusal category.
-    fn detect_server_fallback(response: &NativeChatResponse, requested_model: &str) {
+    fn server_fallback_notice(
+        response: &NativeChatResponse,
+        requested_model: &str,
+    ) -> Option<SafeguardFallbackNotice> {
         let fallback_ran = response
             .usage
             .as_ref()
@@ -2079,17 +2072,17 @@ impl AnthropicModelProvider {
                     .any(|iteration| iteration.kind.as_deref() == Some("fallback_message"))
             });
         if !fallback_ran {
-            return;
+            return None;
         }
 
         match response.model.as_deref() {
             Some(served) if served != requested_model => {
-                record_safeguard_fallback(SafeguardFallbackNotice {
+                let notice = SafeguardFallbackNotice {
                     kind: SafeguardFallbackKind::ServerSide,
                     requested_model: requested_model.to_string(),
                     served_model: served.to_string(),
                     category: None,
-                });
+                };
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2100,6 +2093,7 @@ impl AnthropicModelProvider {
                         })),
                     "anthropic server-side fallback: turn served by a fallback model"
                 );
+                Some(notice)
             }
             _ => {
                 // A fallback attempt ran but the served model is absent or
@@ -2116,6 +2110,7 @@ impl AnthropicModelProvider {
                         })),
                     "anthropic server-side fallback ran but served model is absent or self-referential"
                 );
+                None
             }
         }
     }
@@ -2201,6 +2196,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse(
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        requested_model: &str,
     ) {
         use tokio_util::io::StreamReader;
 
@@ -2208,7 +2204,7 @@ impl AnthropicModelProvider {
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
-        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+        Self::parse_anthropic_sse_from_reader(reader, tx, requested_model).await;
     }
 
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
@@ -2216,6 +2212,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse_from_reader<R>(
         reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        requested_model: &str,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
@@ -2408,12 +2405,10 @@ impl AnthropicModelProvider {
                         output_tokens = Some(v);
                     }
                     if stop_reason == "refusal" {
-                        // Forward any billed partial tokens exactly as the
-                        // normal completion path (message_stop) does, so cost
-                        // tracking still sees them, then terminate the stream
-                        // with an error and return WITHOUT emitting Final or
-                        // calling finish_sse_stream — mirroring the "error" arm.
-                        if input_tokens.is_some()
+                        // Carry billed partial tokens on the typed cause. The
+                        // recovery owner accounts them once and can skip the
+                        // already-refused candidate instead of replaying it.
+                        let usage = if input_tokens.is_some()
                             || output_tokens.is_some()
                             || cached_input_tokens.is_some()
                             || cache_creation_input_tokens.is_some()
@@ -2426,18 +2421,24 @@ impl AnthropicModelProvider {
                                     .saturating_add(cache_read)
                                     .saturating_add(cache_create),
                             );
-                            let _ = tx
-                                .send(Ok(StreamEvent::Usage(TokenUsage {
-                                    input_tokens: normalized_input,
-                                    output_tokens,
-                                    cached_input_tokens,
-                                })))
-                                .await;
-                        }
+                            Some(TokenUsage {
+                                input_tokens: normalized_input,
+                                output_tokens,
+                                cached_input_tokens,
+                            })
+                        } else {
+                            None
+                        };
                         let _ = tx
-                            .send(Err(StreamError::ModelProvider(
-                                ANTHROPIC_REFUSAL_MESSAGE.to_string(),
-                            )))
+                            .send(Err(StreamError::ModelRefusal(Box::new(
+                                AnthropicRefusalError {
+                                    requested_model: requested_model.to_string(),
+                                    category: None,
+                                    usage: usage.map(Box::new),
+                                    attempted_candidate: None,
+                                    attempted_candidate_index: None,
+                                },
+                            ))))
                             .await;
                         return;
                     }
@@ -2532,6 +2533,7 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        commit_safeguard_fallback(None);
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2601,10 +2603,15 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
         Self::check_refusal(&chat_response, model)?;
-        Self::detect_server_fallback(&chat_response, model);
+        let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
-        Self::require_terminal_text(parsed)
+        let result = Self::require_terminal_text(parsed);
+        if result.is_ok() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
+        result
     }
 
     async fn chat(
@@ -2613,6 +2620,10 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        commit_safeguard_fallback(None);
+        if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
+            return Err(anyhow::Error::new(refusal));
+        }
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2709,9 +2720,14 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
         Self::check_refusal(&native_response, model)?;
-        Self::detect_server_fallback(&native_response, model);
-        Ok(Self::parse_native_response(native_response))
+        let safeguard_notice = Self::server_fallback_notice(&native_response, model);
+        let parsed = Self::parse_native_response(native_response);
+        if !parsed.is_semantically_empty_terminal() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
+        Ok(parsed)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -2818,6 +2834,7 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
@@ -2934,10 +2951,15 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
-                Self::check_refusal(&parsed, &requested_model).map_err(|_| {
-                    StreamError::ModelProvider(ANTHROPIC_REFUSAL_MESSAGE.to_string())
-                })?;
-                Ok(Self::parse_native_response(parsed))
+                commit_safeguard_fallback(None);
+                Self::check_refusal(&parsed, &requested_model)
+                    .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
+                let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
+                let response = Self::parse_native_response(parsed);
+                if !response.is_semantically_empty_terminal() {
+                    commit_safeguard_fallback(safeguard_notice);
+                }
+                Ok(response)
             })
             .flat_map(|result| match result {
                 Ok(resp) => {
@@ -3019,6 +3041,7 @@ impl ModelProvider for AnthropicModelProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
+        let requested_model = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -3089,7 +3112,7 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx).await;
+            Self::parse_anthropic_sse(response, &tx, &requested_model).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
@@ -3403,7 +3426,8 @@ data: {\"type\":\"message_stop\"}\n\n"
         let bytes = fake_anthropic_sse();
         let reader = tokio::io::BufReader::new(Cursor::new(bytes));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
@@ -3519,7 +3543,12 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         let (tx, _rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(
+                reader,
+                &tx,
+                "claude-sonnet-4-6",
+            )
+            .await;
         });
         let probe = handle.abort_handle();
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -3627,7 +3656,8 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut saw_final = false;
         let mut last_err = None;
@@ -3665,7 +3695,8 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut saw_usage = false;
         while let Ok(Some(ev)) =
@@ -8197,7 +8228,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         // Same boundary for the thinking-stream mapping, which the
         // orchestrator renders through the identical sanitizer.
-        let stream_err = StreamError::ModelProvider(ANTHROPIC_REFUSAL_MESSAGE.to_string());
+        let stream_err =
+            StreamError::ModelRefusal(Box::new(refusal_error_with_sentinel_category()));
         let stream_text = crate::sanitize_api_error(&stream_err.to_string());
         assert!(
             !stream_text.contains(CATEGORY_SENTINEL),
@@ -8272,6 +8304,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             .downcast_ref::<AnthropicRefusalError>()
             .expect("error must downcast to AnthropicRefusalError");
         assert_eq!(typed.category.as_deref(), Some("frontier_llm"));
+        assert_eq!(
+            typed.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(5)
+        );
     }
 
     #[tokio::test]
@@ -8302,15 +8338,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
             "a refusal must not emit a Final event"
         );
-        let msg = events
+        let refusal = events
             .iter()
             .find_map(|e| match e {
-                Err(StreamError::ModelProvider(msg)) => Some(msg.clone()),
+                Err(StreamError::ModelRefusal(refusal)) => Some(refusal),
                 _ => None,
             })
-            .expect("stream must yield a ModelProvider error");
-        assert_eq!(msg, ANTHROPIC_REFUSAL_MESSAGE);
-        assert!(!msg.contains("CATEGORY_SENTINEL"));
+            .expect("stream must yield a typed refusal");
+        assert_eq!(refusal.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        assert_eq!(
+            refusal.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(5)
+        );
+        assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
+        assert!(!refusal.to_string().contains("CATEGORY_SENTINEL"));
     }
 
     // ----- Server-side fallback detection (§4) -------------------------
@@ -8526,7 +8567,8 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(sse));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
@@ -8540,31 +8582,19 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             "a refusal must not emit a Final event"
         );
 
-        // Billed partial tokens must be forwarded as a Usage event BEFORE the
-        // error, with input normalized to uncached + cache_read + cache_create
-        // (412 + 100 + 50 = 562) exactly as the normal completion path does.
-        let usage_idx = events
+        // Billed partial tokens travel on the typed cause, so a recovery
+        // cannot separate or double-count them while skipping this candidate.
+        let refusal = events
             .iter()
-            .position(|e| matches!(e, Ok(StreamEvent::Usage(_))))
-            .expect("refusal must still forward a Usage event for billed tokens");
-        if let Ok(StreamEvent::Usage(usage)) = &events[usage_idx] {
-            assert_eq!(usage.input_tokens, Some(562), "normalized input tokens");
-            assert_eq!(usage.output_tokens, Some(0), "output tokens");
-            assert_eq!(usage.cached_input_tokens, Some(100), "cache_read tokens");
-        }
-
-        let err_idx = events
-            .iter()
-            .position(|e| matches!(e, Err(StreamError::ModelProvider(_))))
-            .expect("stream must yield a ModelProvider error");
-        assert!(
-            usage_idx < err_idx,
-            "Usage must be forwarded before the refusal error"
-        );
-        let msg = match &events[err_idx] {
-            Err(StreamError::ModelProvider(msg)) => msg.clone(),
-            _ => unreachable!(),
-        };
-        assert_eq!(msg, ANTHROPIC_REFUSAL_MESSAGE);
+            .find_map(|event| match event {
+                Err(StreamError::ModelRefusal(refusal)) => Some(refusal),
+                _ => None,
+            })
+            .expect("stream must yield a typed refusal");
+        let usage = refusal.usage.as_ref().expect("refusal usage");
+        assert_eq!(usage.input_tokens, Some(562), "normalized input tokens");
+        assert_eq!(usage.output_tokens, Some(0), "output tokens");
+        assert_eq!(usage.cached_input_tokens, Some(100), "cache_read tokens");
+        assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
     }
 }

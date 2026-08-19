@@ -958,6 +958,7 @@ fn safeguard_fallback_ws_frame(
     let fallback_kind = match notice.kind {
         zeroclaw_providers::SafeguardFallbackKind::ServerSide => "server",
         zeroclaw_providers::SafeguardFallbackKind::ClientSide => "client",
+        zeroclaw_providers::SafeguardFallbackKind::ClientAndServer => "client_server",
     };
     Some(serde_json::json!({
         "type": "safeguard_fallback",
@@ -965,6 +966,16 @@ fn safeguard_fallback_ws_frame(
         "requested_model": notice.requested_model,
         "served_model": notice.served_model,
     }))
+}
+
+fn success_terminal_ws_frames(
+    safeguard_notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
+    done: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    safeguard_fallback_ws_frame(safeguard_notice)
+        .into_iter()
+        .chain(std::iter::once(done))
+        .collect()
 }
 
 fn needs_onboarding_ws_error(
@@ -1507,10 +1518,6 @@ async fn process_chat_message(
             // `outcome.new_messages`, so it is not persisted into the session
             // transcript. Privacy: only the model names cross the wire — the
             // classifier `category` (and any refusal explanation) never do.
-            if let Some(frame) = safeguard_fallback_ws_frame(safeguard_notice.as_ref()) {
-                let _ = sender.send(Message::Text(frame.to_string().into())).await;
-            }
-
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
@@ -1523,7 +1530,9 @@ async fn process_chat_message(
                 "max_context_tokens": max_context_tokens,
                 "last_input_tokens": last_input_tokens,
             });
-            let _ = sender.send(Message::Text(done.to_string().into())).await;
+            for frame in success_terminal_ws_frames(safeguard_notice.as_ref(), done) {
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
@@ -2098,6 +2107,54 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         assert_eq!(frame["fallback_kind"], "server");
         assert_eq!(frame["type"], "safeguard_fallback");
+    }
+
+    #[test]
+    fn safeguard_fallback_frame_preserves_composed_recovery() {
+        use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
+        let notice = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ClientAndServer,
+            requested_model: "model-a".to_string(),
+            served_model: "model-c".to_string(),
+            category: Some("private-category".to_string()),
+        };
+
+        let frame = safeguard_fallback_ws_frame(Some(&notice)).expect("composed frame");
+        assert_eq!(frame["fallback_kind"], "client_server");
+        assert_eq!(frame["requested_model"], "model-a");
+        assert_eq!(frame["served_model"], "model-c");
+        assert!(!frame.to_string().contains("private-category"));
+    }
+
+    #[test]
+    fn safeguard_success_sequence_emits_exactly_one_notice_before_done() {
+        use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
+        let notice = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ClientAndServer,
+            requested_model: "model-a".to_string(),
+            served_model: "model-c".to_string(),
+            category: Some("private-category".to_string()),
+        };
+
+        let frames = success_terminal_ws_frames(
+            Some(&notice),
+            serde_json::json!({"type": "done", "full_response": "accepted"}),
+        );
+        let frame_types: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| frame["type"].as_str())
+            .collect();
+
+        assert_eq!(frame_types, ["safeguard_fallback", "done"]);
+        assert_eq!(
+            frame_types
+                .iter()
+                .filter(|kind| **kind == "safeguard_fallback")
+                .count(),
+            1
+        );
+        assert!(!frames[0].to_string().contains("private-category"));
+        assert_eq!(frames[1]["full_response"], "accepted");
     }
 
     #[test]

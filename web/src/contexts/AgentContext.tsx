@@ -441,7 +441,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         if (!served || !requested) break;
         const key = msg.fallback_kind === 'server'
           ? 'agent.safeguard_fallback_server'
-          : 'agent.safeguard_fallback_client';
+          : msg.fallback_kind === 'client_server'
+            ? 'agent.safeguard_fallback_client_server'
+            : 'agent.safeguard_fallback_client';
         const content = t(key)
           .replace('{requested}', requested)
           .replace('{served}', served);
