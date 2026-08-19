@@ -1696,33 +1696,48 @@ impl TelegramChannel {
     }
 
     /// True when `message` carries content one of the update parsers
-    /// would actually process for an authorized sender, mirroring each
-    /// parser's own bail conditions: top-level `text` is always
-    /// processable (`parse_update_message`); a `voice`/`audio` payload
-    /// (`parse_voice_metadata`) only when the transcription config and
-    /// manager `try_parse_voice_message` requires are both present; a
-    /// `document`/`photo` payload (`parse_attachment_metadata`) only
-    /// when the workspace dir `try_parse_attachment_message` downloads
-    /// into is set. This only covers the config-shaped bails (is
-    /// transcription/workspace even configured); the content-shaped
-    /// permanent bails — over-`max_duration_secs` voice/audio and
-    /// over-`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES` attachments — are checked
-    /// separately by `message_exceeds_parser_limits`, kept out of this
-    /// predicate specifically so a captioned `/bind <code>` still reaches
-    /// the pairing branch in `handle_unauthorized_message` even on media
+    /// would actually process for an authorized sender.
+    ///
+    /// Acceptance is resolved from the canonical typed parsers rather
+    /// than from raw JSON key presence, so this predicate cannot drift
+    /// from what the parsers accept: `text` must deserialize as a string
+    /// (`parse_update_message`), a `voice`/`audio` payload must yield
+    /// metadata via `parse_voice_metadata`, and a `document`/`photo`
+    /// payload must yield an `IncomingAttachment` via
+    /// `parse_attachment_metadata` (which rejects a missing/non-string
+    /// `file_id` and an empty `photo` array). Telegram response JSON is
+    /// an external trust boundary, so its shape is validated before any
+    /// behavior — including the approval notice — is triggered.
+    ///
+    /// The live config gates are retained alongside the typed checks:
+    /// voice/audio only counts when the transcription config and manager
+    /// `try_parse_voice_message` requires are both present, and
+    /// document/photo only when the workspace dir
+    /// `try_parse_attachment_message` downloads into is set.
+    ///
+    /// This covers the config-shaped and shape-shaped bails; the
+    /// content-shaped permanent bails — over-`max_duration_secs`
+    /// voice/audio and over-`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`
+    /// attachments — are checked separately by
+    /// `message_exceeds_parser_limits`, kept out of this predicate
+    /// specifically so a captioned `/bind <code>` still reaches the
+    /// pairing branch in `handle_unauthorized_message` even on media
     /// those limits would otherwise reject.
     fn message_has_processable_content(&self, message: &serde_json::Value) -> bool {
-        if message.get("text").is_some() {
+        if message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
             return true;
         }
         if self.transcription.is_some()
             && self.transcription_manager.is_some()
-            && (message.get("voice").is_some() || message.get("audio").is_some())
+            && Self::parse_voice_metadata(message).is_some()
         {
             return true;
         }
-        self.workspace_dir.is_some()
-            && (message.get("document").is_some() || message.get("photo").is_some())
+        self.workspace_dir.is_some() && Self::parse_attachment_metadata(message).is_some()
     }
 
     /// True when `message` is a voice/audio or document/photo update that
@@ -7931,7 +7946,7 @@ mod tests {
         handle.abort();
     }
 
-    /// Drive `listen()` with `unauthorized_update` (sent by "mallory",
+    /// Drive `listen()` with `unauthorized_update` (sent by "zeroclaw_unauthorized",
     /// who is not on the allowlist) followed by an authorized text update
     /// in the same chat, asserting the shared unauthorized-update
     /// contract: no `getFile` download, exactly `expected_notices`
@@ -7958,7 +7973,7 @@ mod tests {
         let chat_id = unauthorized_update["message"]["chat"]["id"]
             .as_i64()
             .expect("unauthorized update must carry a chat id");
-        let text_update = telegram_text_update(uid2, 1, chat_id, "alice", "world");
+        let text_update = telegram_text_update(uid2, 1, chat_id, "zeroclaw_user", "world");
 
         mount_telegram_get_updates(
             &mock_server,
@@ -7995,7 +8010,7 @@ mod tests {
             TelegramChannel::new(
                 "test-token".into(),
                 "telegram_test_alias",
-                Arc::new(|| vec!["alice".to_string()]),
+                Arc::new(|| vec!["zeroclaw_user".to_string()]),
                 false,
             )
             .with_api_base(mock_server.uri()),
@@ -8009,7 +8024,7 @@ mod tests {
             .await
             .expect("timed out waiting for the authorized message")
             .expect("channel closed before delivering the authorized message");
-        assert_eq!(msg.sender, "alice");
+        assert_eq!(msg.sender, "zeroclaw_user");
         assert_eq!(msg.content, "world");
 
         // The unauthorized update must never be delivered.
@@ -8758,7 +8773,8 @@ mod tests {
     /// get the same "requires operator approval" notice a text sender gets.
     #[tokio::test]
     async fn listen_acknowledges_unauthorized_voice_update_without_download() {
-        let voice_update = telegram_voice_update(5_000, 30, 999, "mallory", "voice789");
+        let voice_update =
+            telegram_voice_update(5_000, 30, 999, "zeroclaw_unauthorized", "voice789");
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             api_key: Some("test_key".to_string()),
@@ -8776,8 +8792,14 @@ mod tests {
     /// update carries no top-level `text`, only a `document` payload.
     #[tokio::test]
     async fn listen_notifies_unauthorized_document_update_without_download() {
-        let document_update =
-            telegram_document_update(6_000, 40, 1_010, "mallory", "file999", "report.pdf");
+        let document_update = telegram_document_update(
+            6_000,
+            40,
+            1_010,
+            "zeroclaw_unauthorized",
+            "file999",
+            "report.pdf",
+        );
         let workspace = tempfile::tempdir().unwrap();
         let workspace_path = workspace.path().to_path_buf();
         assert_listen_skips_unauthorized_update(
@@ -8797,7 +8819,8 @@ mod tests {
     /// notice too — no download, no notice, offset still advances.
     #[tokio::test]
     async fn listen_skips_unauthorized_over_duration_voice_update_without_notice() {
-        let mut voice_update = telegram_voice_update(5_100, 31, 1_020, "mallory", "voice999");
+        let mut voice_update =
+            telegram_voice_update(5_100, 31, 1_020, "zeroclaw_unauthorized", "voice999");
         voice_update["message"]["voice"]["duration"] = serde_json::json!(200);
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
@@ -8818,8 +8841,14 @@ mod tests {
     /// notice too — no download, no notice, offset still advances.
     #[tokio::test]
     async fn listen_skips_unauthorized_oversized_document_update_without_notice() {
-        let mut document_update =
-            telegram_document_update(6_100, 41, 1_030, "mallory", "file000", "huge.pdf");
+        let mut document_update = telegram_document_update(
+            6_100,
+            41,
+            1_030,
+            "zeroclaw_unauthorized",
+            "file000",
+            "huge.pdf",
+        );
         document_update["message"]["document"]["file_size"] =
             serde_json::json!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1);
         let workspace = tempfile::tempdir().unwrap();
@@ -8845,7 +8874,7 @@ mod tests {
             "message": {
                 "message_id": 60,
                 "chat": {"id": 1_020, "type": "private"},
-                "from": {"id": 160_000, "username": "mallory"},
+                "from": {"id": 160_000, "username": "zeroclaw_unauthorized"},
                 "sticker": {"file_id": "sticker123", "width": 512, "height": 512},
             }
         });
@@ -8856,11 +8885,95 @@ mod tests {
             "message": {
                 "message_id": 61,
                 "chat": {"id": 1_030, "type": "group"},
-                "from": {"id": 161_000, "username": "mallory"},
-                "new_chat_members": [{"id": 161_000, "username": "mallory"}],
+                "from": {"id": 161_000, "username": "zeroclaw_unauthorized"},
+                "new_chat_members": [{"id": 161_000, "username": "zeroclaw_unauthorized"}],
             }
         });
         assert_listen_skips_unauthorized_update(service_update, |ch| ch, 0).await;
+    }
+
+    /// Payloads whose *shape* the canonical parsers reject must not draw a
+    /// notice either, even when the deployment is fully configured for that
+    /// media kind. `message_has_processable_content` resolves acceptance
+    /// through `text.as_str()`, `parse_voice_metadata`, and
+    /// `parse_attachment_metadata` rather than raw JSON key presence, so a
+    /// null `text`, an empty `voice`/`document` object, or an empty `photo`
+    /// array is treated exactly as it would be for an authorized sender:
+    /// dropped as a permanent skip with no notice, no download, and no
+    /// dispatch, while the offset still advances past it.
+    ///
+    /// Telegram response JSON is an external trust boundary, so its shape
+    /// is validated before the notice behavior is triggered.
+    #[tokio::test]
+    async fn listen_stays_silent_for_unauthorized_media_the_parsers_would_reject() {
+        fn malformed_update(
+            update_id: i64,
+            message_id: i64,
+            chat_id: i64,
+            payload: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut message = serde_json::json!({
+                "message_id": message_id,
+                "chat": {"id": chat_id, "type": "private"},
+                "from": {"id": 162_000, "username": "zeroclaw_unauthorized"},
+            });
+            let serde_json::Value::Object(fields) = payload else {
+                unreachable!("malformed payload fixture must be a JSON object");
+            };
+            for (key, value) in fields {
+                message[key] = value;
+            }
+            serde_json::json!({"update_id": update_id, "message": message})
+        }
+
+        fn transcription_config() -> zeroclaw_config::schema::TranscriptionConfig {
+            zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test_key".to_string()),
+                max_duration_secs: 120,
+                ..Default::default()
+            }
+        }
+
+        // `text` present but not a string — `parse_update_message` bails on
+        // `as_str()`, so an authorized sender's identical update is dropped.
+        let null_text = malformed_update(7_400, 64, 1_060, serde_json::json!({"text": null}));
+        assert_listen_skips_unauthorized_update(null_text, |ch| ch, 0).await;
+
+        // `voice` present but carrying no `file_id` — `parse_voice_metadata`
+        // returns `None` even with transcription fully configured.
+        let empty_voice = malformed_update(7_500, 65, 1_070, serde_json::json!({"voice": {}}));
+        assert_listen_skips_unauthorized_update(
+            empty_voice,
+            |ch| ch.with_transcription(transcription_config()),
+            0,
+        )
+        .await;
+
+        // `document` present but carrying no `file_id` —
+        // `parse_attachment_metadata` returns `None` even with a workspace dir.
+        let empty_document =
+            malformed_update(7_600, 66, 1_080, serde_json::json!({"document": {}}));
+        let document_workspace = tempfile::tempdir().unwrap();
+        let document_workspace_path = document_workspace.path().to_path_buf();
+        assert_listen_skips_unauthorized_update(
+            empty_document,
+            |ch| ch.with_workspace_dir(document_workspace_path),
+            0,
+        )
+        .await;
+
+        // Empty `photo` array — `parse_attachment_metadata` bails on
+        // `photos.last()`, so there is no highest-resolution size to download.
+        let empty_photo = malformed_update(7_700, 67, 1_090, serde_json::json!({"photo": []}));
+        let photo_workspace = tempfile::tempdir().unwrap();
+        let photo_workspace_path = photo_workspace.path().to_path_buf();
+        assert_listen_skips_unauthorized_update(
+            empty_photo,
+            |ch| ch.with_workspace_dir(photo_workspace_path),
+            0,
+        )
+        .await;
     }
 
     /// Media the deployment is not configured to process must not draw a
@@ -8872,11 +8985,18 @@ mod tests {
     /// neither configured.
     #[tokio::test]
     async fn listen_stays_silent_for_unauthorized_media_the_deployment_cannot_process() {
-        let voice_update = telegram_voice_update(7_200, 62, 1_040, "mallory", "voice321");
+        let voice_update =
+            telegram_voice_update(7_200, 62, 1_040, "zeroclaw_unauthorized", "voice321");
         assert_listen_skips_unauthorized_update(voice_update, |ch| ch, 0).await;
 
-        let document_update =
-            telegram_document_update(7_300, 63, 1_050, "mallory", "file222", "notes.pdf");
+        let document_update = telegram_document_update(
+            7_300,
+            63,
+            1_050,
+            "zeroclaw_unauthorized",
+            "file222",
+            "notes.pdf",
+        );
         assert_listen_skips_unauthorized_update(document_update, |ch| ch, 0).await;
     }
 
@@ -8884,9 +9004,12 @@ mod tests {
     /// `caption` treated the same as a text sender's `text` — specifically,
     /// a `/bind <code>` in the caption must reach `extract_bind_code` and
     /// take the pairing branch, not the plain unauthorized-approval notice.
-    /// Exercised directly against `handle_unauthorized_message` since no
-    /// listen()-level pairing harness exists yet and building one is not
-    /// justified for this single assertion.
+    /// Exercised directly against `handle_unauthorized_message` as
+    /// lower-level coverage that complements the listener-level regression
+    /// `listen_routes_captioned_bind_on_oversized_document_without_download`:
+    /// this pins the caption-to-pairing branch in isolation, while that one
+    /// proves the same behavior through the real poll/parser/authorization
+    /// path.
     #[tokio::test]
     async fn handle_unauthorized_message_reads_bind_code_from_caption() {
         use wiremock::MockServer;
@@ -8908,8 +9031,14 @@ mod tests {
         .with_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
-        let mut update =
-            telegram_document_update(9_000, 50, 2_020, "mallory", "file111", "notes.pdf");
+        let mut update = telegram_document_update(
+            9_000,
+            50,
+            2_020,
+            "zeroclaw_unauthorized",
+            "file111",
+            "notes.pdf",
+        );
         // Generated pairing codes are always exactly six digits, so a
         // non-digit code can never accidentally match and the invalid-code
         // branch is deterministic.
@@ -8955,8 +9084,14 @@ mod tests {
 
         let uid = 9_100;
         let chat_id = 2_120;
-        let mut update =
-            telegram_document_update(uid, 51, chat_id, "mallory", "file112", "huge.pdf");
+        let mut update = telegram_document_update(
+            uid,
+            51,
+            chat_id,
+            "zeroclaw_unauthorized",
+            "file112",
+            "huge.pdf",
+        );
         update["message"]["document"]["file_size"] =
             serde_json::json!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1);
         update["message"]["caption"] = serde_json::json!("/bind not-a-real-code");
