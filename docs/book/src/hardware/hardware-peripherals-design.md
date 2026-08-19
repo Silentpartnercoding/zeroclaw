@@ -170,8 +170,8 @@ Each connected board is driven over one of the subsystem transports:
 
 {{#include ../_snippets/hardware-transports.md}}
 
-The base tools every board exposes, plus the datasheet tool, are
-listed in [Hardware subsystem → Runtime tools](./subsystem.md#runtime-tools).
+The base tools every board exposes are listed in
+[Hardware subsystem → Runtime tools](./subsystem.md#runtime-tools).
 
 ## 7. Communication Protocols
 
