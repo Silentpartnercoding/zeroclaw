@@ -5083,6 +5083,18 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+/// Whether a recovered request crossed provider families and needs a channel footer.
+///
+/// Exact configured aliases deliberately do not participate here: callers of this
+/// channel boundary receive stable provider-family display names only.
+fn fallback_crossed_provider_family(requested_provider: &str, actual_provider: &str) -> bool {
+    let requested_base = requested_provider.split(':').next().unwrap_or("");
+    let actual_base = actual_provider.split(':').next().unwrap_or("");
+    !(requested_base == actual_base
+        || requested_base.starts_with(actual_base)
+        || actual_base.starts_with(requested_base))
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -5485,6 +5497,7 @@ async fn process_channel_message_body(
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
+            route.model.as_str(),
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools,
             ctx.activated_tools.as_ref(),
@@ -6397,11 +6410,7 @@ async fn process_channel_message_body(
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed. A safeguard
             // (refusal-triggered) notice always wins and is exempt from the same-family gate.
             let generic_same_family = fallback_info.as_ref().is_some_and(|fb| {
-                let req_base = fb.requested_provider.split(':').next().unwrap_or("");
-                let act_base = fb.actual_provider.split(':').next().unwrap_or("");
-                req_base == act_base
-                    || req_base.starts_with(act_base)
-                    || act_base.starts_with(req_base)
+                !fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider)
             });
             match select_response_footer(
                 fallback_info.as_ref(),
@@ -13950,6 +13959,19 @@ api_key = "anthropic-key"
             "15551234567@s.whatsapp.net",
         );
         assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn same_family_alias_fallback_does_not_need_channel_footer() {
+        // Reliable retains these family fields for the channel boundary even
+        // when delegate-local attribution distinguishes aliases such as
+        // `custom.primary` and `custom.backup`.
+        assert!(!fallback_crossed_provider_family("custom", "custom"));
+    }
+
+    #[test]
+    fn cross_family_fallback_needs_channel_footer() {
+        assert!(fallback_crossed_provider_family("anthropic", "openai"));
     }
 
     #[test]
