@@ -147,9 +147,13 @@ commands, cancellation, reply intent, receipts, and cost tracking. That future
 convergence must preserve the authenticated-ingress proof and each transport's
 synchronous or fast-ack response behavior.
 
-An adapter with no inbound credential mechanism does not get optional
-verification; its registry entry is declared unverifiable and every dispatch
-request is refused. Silent fall-through is not an authentication mode.
+Every message-dispatching webhook adapter in the registry declares a required
+per-alias credential and is refused before parsing when that credential is
+missing, blank, or unresolved. The registry has no optional-verification mode:
+silent fall-through is not an authentication mode. An adapter with no inbound
+credential mechanism therefore cannot be registered as message-dispatching
+today; adding one would require extending the registry with an explicit
+refuse-only policy rather than relaxing verification.
 
 When reviewing webhook changes, compare synchronous handlers and fast-ack
 handlers separately:
