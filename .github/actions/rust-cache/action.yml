@@ -51,12 +51,10 @@ runs:
       run: |
         bash "$GITHUB_WORKSPACE/scripts/ci/install_sccache.sh"
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-        # Temporary branch-scoped namespace for PR #10154's seed/read test.
-        echo "SCCACHE_GHA_VERSION=zeroclaw-pr10154-branch-v1" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_VERSION=zeroclaw-v1" >> "$GITHUB_ENV"
         echo "SCCACHE_BASEDIRS=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-        if [[ "$GITHUB_EVENT_NAME" == "push" && \
-              "$GITHUB_REF" == "refs/heads/ci/blacksmith-shared-sccache" ]]; then
+        if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
           echo "SCCACHE_GHA_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
         else
           echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"
