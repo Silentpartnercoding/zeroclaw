@@ -1169,11 +1169,6 @@ impl TranscriptionManager {
             .map(|k| k.as_str())
             .collect()
     }
-
-    #[cfg(test)]
-    pub(crate) fn agent_transcription_provider(&self) -> &str {
-        &self.agent_transcription_provider
-    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for GroqProvider {

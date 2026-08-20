@@ -842,8 +842,8 @@ mod tests {
 
     // ── Transcription provider binding tests ───────────────────
 
-    #[test]
-    fn with_agent_transcription_provider_binds_provider_not_alias() {
+    #[tokio::test]
+    async fn with_agent_transcription_provider_binds_provider_not_alias() {
         let channel = VoiceWakeChannel::new(
             "frontdoor",
             VoiceWakeConfig::default(),
@@ -852,24 +852,33 @@ mod tests {
         .with_agent_transcription_provider("groq.default");
 
         let manager = channel.build_transcription_manager().unwrap();
-        assert_eq!(manager.agent_transcription_provider(), "groq.default");
+        let err = manager
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("groq.default"), "got: {err}");
+        assert!(!err.contains("'frontdoor'"), "got: {err}");
         assert_eq!(channel.alias, "frontdoor");
-        assert_ne!(manager.agent_transcription_provider(), channel.alias);
     }
 
-    #[test]
-    fn agent_transcription_provider_defaults_empty_when_unset() {
+    #[tokio::test]
+    async fn agent_transcription_provider_defaults_empty_when_unset() {
         let channel = VoiceWakeChannel::new(
             "frontdoor",
             VoiceWakeConfig::default(),
             TranscriptionConfig::default(),
         );
+        let err = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            channel
-                .build_transcription_manager()
-                .unwrap()
-                .agent_transcription_provider()
-                .is_empty()
+            err.contains("no transcription_provider configured"),
+            "got: {err}"
         );
     }
 
