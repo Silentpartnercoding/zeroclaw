@@ -19,6 +19,53 @@ pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<us
         .context("count live ACP sessions for agent")
 }
 
+fn resolve_memory_for_owned_state(
+    config: &Config,
+    memory: Option<&Arc<dyn Memory>>,
+) -> anyhow::Result<Option<Arc<dyn Memory>>> {
+    // An already-open handle may still contain rows after a live config toggle;
+    // preserve the pre-existing cleanup behavior instead of stranding those
+    // rows when the currently selected backend is `none`.
+    if let Some(memory) = memory {
+        return Ok(Some(Arc::clone(memory)));
+    }
+
+    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
+    if matches!(
+        zeroclaw_memory::classify_memory_backend(&backend),
+        zeroclaw_memory::MemoryBackendKind::None
+    ) {
+        return Ok(None);
+    }
+
+    zeroclaw_memory::create_memory_from_config(config, None)
+        .map(Arc::from)
+        .map(Some)
+        .context("open configured memory backend for owned-state recovery")
+}
+
+fn resolve_session_backend_for_owned_state(
+    config: &Config,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+) -> std::io::Result<Option<Arc<dyn SessionBackend>>> {
+    // As with memory, an existing handle is authoritative evidence that a
+    // durable store is reachable and may contain stale attribution from before
+    // a live config toggle.
+    if let Some(session_backend) = session_backend {
+        return Ok(Some(Arc::clone(session_backend)));
+    }
+    // Gateway WebSocket and channel histories share this backend. Only an
+    // absent handle with both producers disabled means there is no configured
+    // store to recover; otherwise absence means the expected store is
+    // unavailable and must fail toward another retry.
+    if !config.gateway.session_persistence && !config.channels.session_persistence {
+        return Ok(None);
+    }
+
+    zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
+        .map(Some)
+}
+
 /// Does durable owned state still exist for `alias` after its config entry is
 /// already gone?
 ///
@@ -66,10 +113,17 @@ pub async fn committed_delete_residue_exists(
         Err(_) => return true,
     }
 
-    if let Some(mem) = mem
-        && mem.count_agent(alias).await.unwrap_or(1) > 0
-    {
-        return true;
+    match resolve_memory_for_owned_state(config, mem) {
+        Ok(Some(mem))
+            if mem
+                .export_agent(alias)
+                .await
+                .map_or(true, |rows| !rows.is_empty()) =>
+        {
+            return true;
+        }
+        Err(_) => return true,
+        Ok(_) => {}
     }
 
     let knowledge_path = config.knowledge.resolved_db_path();
@@ -84,10 +138,12 @@ pub async fn committed_delete_residue_exists(
         }
     }
 
-    if let Some(backend) = session_backend
-        && backend.count_agent_attribution(alias).unwrap_or(1) > 0
-    {
-        return true;
+    match resolve_session_backend_for_owned_state(config, session_backend) {
+        Ok(Some(backend)) if backend.count_agent_attribution(alias).unwrap_or(1) > 0 => {
+            return true;
+        }
+        Err(_) => return true,
+        Ok(_) => {}
     }
 
     false
@@ -241,10 +297,18 @@ pub async fn cascade_owned_state(
     }
     let mut warnings: Vec<String> = Vec::new();
 
+    let resolved_memory = match resolve_memory_for_owned_state(config, mem) {
+        Ok(memory) => memory,
+        Err(error) => {
+            warnings.push(format!("memory backend unavailable: {error}"));
+            None
+        }
+    };
+
     // ── memory: export → archive → purge. Failures are SURFACED in `warnings`,
     // not masked as 0 (markdown/none have no DB rows — their memory lives in the
     // archived workspace — but a real backend error must stay visible). ────────
-    let memory_purged = if let Some(mem) = mem {
+    let memory_purged = if let Some(mem) = resolved_memory.as_ref() {
         let mem_rows = match mem.export_agent(alias).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -375,7 +439,15 @@ pub async fn cascade_owned_state(
     }
 
     // ── session metadata: clear the stale agent attribution (keep the convo) ─
-    let sessions_cleared = match session_backend {
+    let resolved_session_backend =
+        match resolve_session_backend_for_owned_state(config, session_backend) {
+            Ok(backend) => backend,
+            Err(error) => {
+                warnings.push(format!("session backend unavailable: {error}"));
+                None
+            }
+        };
+    let sessions_cleared = match resolved_session_backend.as_ref() {
         Some(b) => match b.clear_agent_attribution(alias) {
             Ok(n) => n,
             Err(e) => {
@@ -452,7 +524,15 @@ pub async fn cascade_rename_agent(
 ) -> RenameStateReport {
     let mut warnings: Vec<String> = Vec::new();
 
-    let memory_rows = if let Some(mem) = mem {
+    let resolved_memory = match resolve_memory_for_owned_state(config, mem) {
+        Ok(memory) => memory,
+        Err(error) => {
+            warnings.push(format!("memory backend unavailable: {error}"));
+            None
+        }
+    };
+
+    let memory_rows = if let Some(mem) = resolved_memory.as_ref() {
         match mem.rename_agent(from, to).await {
             Ok(n) => n,
             Err(e) => {
@@ -508,7 +588,15 @@ pub async fn cascade_rename_agent(
         }
     };
 
-    let sessions_repointed = match session_backend {
+    let resolved_session_backend =
+        match resolve_session_backend_for_owned_state(config, session_backend) {
+            Ok(backend) => backend,
+            Err(error) => {
+                warnings.push(format!("session backend unavailable: {error}"));
+                None
+            }
+        };
+    let sessions_repointed = match resolved_session_backend.as_ref() {
         Some(b) => match b.rename_agent_attribution(from, to) {
             Ok(n) => n,
             Err(e) => {

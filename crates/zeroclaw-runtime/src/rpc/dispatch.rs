@@ -7478,12 +7478,36 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
+            None,
             Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    fn make_owned_state_recovery_test_dispatcher(
+        config: zeroclaw_config::schema::Config,
+        memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
+        session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    ) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let acp_store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap(),
+        );
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            memory,
+            session_backend,
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer".into())
     }
 
     #[tokio::test]
@@ -7954,6 +7978,210 @@ mod tests {
         )
         .unwrap();
         assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_retries_unavailable_memory_and_blocks_alias_reuse() {
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        let seed_memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory_from_config(&config, None).unwrap());
+        let agent_id = seed_memory.ensure_agent_uuid("alpha").await.unwrap();
+        seed_memory
+            .store_with_agent(
+                "retired-memory-proof",
+                "must not survive alias reuse",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seed_memory.export_agent("alpha").await.unwrap().len(), 1);
+        drop(seed_memory);
+
+        let memory_db = config.data_dir.join("memory/brain.db");
+        let saved_memory_db = config.data_dir.join("memory/brain.db.saved");
+        std::fs::rename(&memory_db, &saved_memory_db).unwrap();
+        std::fs::create_dir(&memory_db).unwrap();
+
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+        let first = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("config deletion must commit while memory cleanup remains retryable");
+
+        assert_eq!(first["deleted"], true);
+        assert!(
+            first["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("memory backend unavailable"))),
+            "the unavailable configured backend must be surfaced: {first:?}"
+        );
+        assert!(
+            first["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|warning| !warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("session backend unavailable"))),
+            "disabled session persistence must not be treated as unavailable: {first:?}"
+        );
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+
+        std::fs::remove_dir(&memory_db).unwrap();
+        std::fs::rename(&saved_memory_db, &memory_db).unwrap();
+
+        let retry = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("retry must reopen the restored memory backend and converge");
+        assert_eq!(retry["deleted"], true);
+        assert_eq!(retry["owned_state"]["memory_purged"], 1);
+
+        let committed = dispatcher.ctx.config.read().clone();
+        let reopened: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory_from_config(&committed, None).unwrap());
+        assert!(reopened.export_agent("alpha").await.unwrap().is_empty());
+        drop(reopened);
+
+        let converged = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("a fully converged delete must return the ordinary absent result");
+        assert_eq!(converged["deleted"], false);
+
+        let mut recreated = committed;
+        recreated.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let recreated_memory = zeroclaw_memory::create_memory_for_agent(&recreated, "alpha", None)
+            .await
+            .unwrap();
+        assert!(
+            recreated_memory
+                .recall("retired-memory-proof", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a recreated alias must not inherit the prior agent's memories"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_retries_unavailable_session_attribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = true;
+        config.channels.session_persistence = false;
+
+        let session_backend =
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir).unwrap();
+        session_backend
+            .append(
+                "retired-session",
+                &zeroclaw_api::model_provider::ChatMessage::user("retained conversation"),
+            )
+            .unwrap();
+        session_backend
+            .set_session_agent_alias("retired-session", "alpha")
+            .unwrap();
+        assert_eq!(session_backend.count_agent_attribution("alpha").unwrap(), 1);
+        drop(session_backend);
+
+        let session_db = config.data_dir.join("sessions/sessions.db");
+        let saved_session_db = config.data_dir.join("sessions/sessions.db.saved");
+        std::fs::rename(&session_db, &saved_session_db).unwrap();
+        std::fs::create_dir(&session_db).unwrap();
+
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+        let first = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("config deletion must commit while session cleanup remains retryable");
+
+        assert_eq!(first["deleted"], true);
+        assert!(
+            first["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("session backend unavailable"))),
+            "the unavailable configured backend must be surfaced: {first:?}"
+        );
+        assert!(
+            first["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|warning| !warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("memory backend unavailable"))),
+            "disabled memory must not be treated as unavailable: {first:?}"
+        );
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+
+        std::fs::remove_dir(&session_db).unwrap();
+        std::fs::rename(&saved_session_db, &session_db).unwrap();
+
+        let retry = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("retry must reopen the restored session backend and converge");
+        assert_eq!(retry["deleted"], true);
+        assert_eq!(retry["owned_state"]["sessions_cleared"], 1);
+
+        let reopened = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(
+            &dispatcher.ctx.config.read().data_dir,
+        )
+        .unwrap();
+        assert_eq!(reopened.count_agent_attribution("alpha").unwrap(), 0);
+        assert_eq!(reopened.load("retired-session").len(), 1);
+        assert_eq!(
+            reopened.get_session_agent_alias("retired-session").unwrap(),
+            None,
+            "the conversation remains, but a recreated alias cannot inherit its attribution"
+        );
+
+        let converged = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("a fully converged delete must return the ordinary absent result");
+        assert_eq!(converged["deleted"], false);
     }
 
     #[test]
