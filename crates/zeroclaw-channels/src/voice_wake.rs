@@ -1,5 +1,6 @@
 //! Voice Wake Word detection channel.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -121,16 +122,16 @@ impl std::fmt::Display for WakeState {
 /// Voice wake-word channel that activates on a spoken keyword.
 pub struct VoiceWakeChannel {
     config: VoiceWakeConfig,
-    transcription_config: TranscriptionConfig,
     /// The alias key under `[channels.voice_wake.<alias>]` this handle is
     /// bound to. Used for attribution and message routing only — never as
     /// a transcription-provider key.
     alias: String,
-    /// Resolved `transcription_provider` of the agent that owns this
-    /// channel binding, set by the orchestrator via
-    /// `with_agent_transcription_provider`. Empty when the owning agent has
-    /// no transcription preference.
-    agent_transcription_provider: String,
+    /// Materializes transcription state from its canonical source when the
+    /// listener starts. The orchestrator replaces the compatibility factory
+    /// with a resolver over live `Config` so reloadable provider policy is
+    /// not copied into this long-lived channel handle.
+    transcription_manager_factory:
+        Arc<dyn Fn() -> Result<TranscriptionManager> + Send + Sync + 'static>,
 }
 
 impl VoiceWakeChannel {
@@ -140,11 +141,12 @@ impl VoiceWakeChannel {
         config: VoiceWakeConfig,
         transcription_config: TranscriptionConfig,
     ) -> Self {
+        let transcription_manager_factory =
+            Arc::new(move || TranscriptionManager::new(&transcription_config));
         Self {
             config,
-            transcription_config,
             alias: alias.into(),
-            agent_transcription_provider: String::new(),
+            transcription_manager_factory,
         }
     }
 
@@ -153,7 +155,21 @@ impl VoiceWakeChannel {
     /// `[channels.voice_wake.<alias>]` routing and must never be used to
     /// select a transcription provider.
     pub fn with_agent_transcription_provider(mut self, provider: impl Into<String>) -> Self {
-        self.agent_transcription_provider = provider.into();
+        let provider = provider.into();
+        let base_factory = Arc::clone(&self.transcription_manager_factory);
+        self.transcription_manager_factory = Arc::new(move || {
+            Ok(base_factory()?.with_agent_transcription_provider(provider.clone()))
+        });
+        self
+    }
+
+    /// Replace the compatibility transcription factory with the channel
+    /// runtime's live-config resolver.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Result<TranscriptionManager> + Send + Sync + 'static,
+    ) -> Self {
+        self.transcription_manager_factory = Arc::new(factory);
         self
     }
 
@@ -161,8 +177,7 @@ impl VoiceWakeChannel {
     /// agent transcription provider. Split out of `listen()` so the wiring
     /// can be exercised without standing up an audio input stream.
     fn build_transcription_manager(&self) -> Result<TranscriptionManager> {
-        Ok(TranscriptionManager::new(&self.transcription_config)?
-            .with_agent_transcription_provider(self.agent_transcription_provider.clone()))
+        (self.transcription_manager_factory)()
     }
 }
 
@@ -836,9 +851,10 @@ mod tests {
         )
         .with_agent_transcription_provider("groq.default");
 
-        assert_eq!(channel.agent_transcription_provider, "groq.default");
+        let manager = channel.build_transcription_manager().unwrap();
+        assert_eq!(manager.agent_transcription_provider(), "groq.default");
         assert_eq!(channel.alias, "frontdoor");
-        assert_ne!(channel.agent_transcription_provider, channel.alias);
+        assert_ne!(manager.agent_transcription_provider(), channel.alias);
     }
 
     #[test]
@@ -848,7 +864,59 @@ mod tests {
             VoiceWakeConfig::default(),
             TranscriptionConfig::default(),
         );
-        assert!(channel.agent_transcription_provider.is_empty());
+        assert!(
+            channel
+                .build_transcription_manager()
+                .unwrap()
+                .agent_transcription_provider()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_typed_provider_dispatches_through_voice_wake_manager() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{Config, LocalWhisperTranscriptionProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "typed provider selected"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut runtime_config = Config::default();
+        runtime_config.providers.transcription.local_whisper.insert(
+            "office".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", server.uri()),
+                ..LocalWhisperTranscriptionProviderConfig::default()
+            },
+        );
+
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        )
+        .with_transcription_manager_factory(move || {
+            TranscriptionManager::from_config_with_provider(
+                &runtime_config,
+                "local_whisper.office".to_string(),
+            )
+        });
+
+        let result = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "typed provider selected");
     }
 
     #[tokio::test]
