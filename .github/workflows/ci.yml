@@ -4,7 +4,10 @@ on:
   pull_request:
     branches: [master]
   push:
-    branches: [master]
+    branches:
+      - master
+      # Temporary trusted-push seed for PR #10154. Removed after measurement.
+      - ci/blacksmith-shared-sccache
   # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
   # and fires `merge_group`. The required `CI Required Gate` must report on that
   # branch or queued PRs stall, so the full gate runs here too.
