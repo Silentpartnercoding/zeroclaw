@@ -1,6 +1,8 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::{SessionBackend, SessionContext, SessionMetadata};
+use crate::session_backend::{
+    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, check_session_ownership,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -355,6 +357,50 @@ impl SessionBackend for SessionStore {
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         self.append(session_key, message)
+    }
+
+    fn load_if_owned(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let _guard = self.mutation_lock.lock();
+        let Some(metadata) = self.metadata_for_session(session_key) else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        Ok(ScopedSessionAccess::Granted(self.load(session_key)))
+    }
+
+    fn append_if_owned(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let _guard = self.mutation_lock.lock();
+        let Some(metadata) = self.metadata_for_session(session_key) else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        self.append_unlocked(session_key, message)?;
+        Ok(ScopedSessionAccess::Granted(()))
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {

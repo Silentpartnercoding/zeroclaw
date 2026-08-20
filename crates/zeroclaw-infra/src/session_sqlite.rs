@@ -1,12 +1,14 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, SessionQuery,
+    SessionState, check_session_ownership,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::collections::BTreeSet;
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -242,29 +244,65 @@ impl SqliteSessionBackend {
 
         Ok(migrated)
     }
+
+    fn load_messages(conn: &Connection, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
+    fn session_ownership(
+        conn: &Connection,
+        session_key: &str,
+    ) -> std::io::Result<Option<(Option<String>, Option<String>)>> {
+        conn.query_row(
+            "SELECT agent_alias, channel_id FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(std::io::Error::other)
+    }
+
+    fn append_message(
+        conn: &Connection,
+        session_key: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (session_key, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_key, message.role, message.content, now],
+        )
+        .map_err(std::io::Error::other)?;
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(session_key) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                message_count = message_count + 1",
+            params![session_key, now, now],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
 }
 
 impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
-        let mut stmt = match conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let rows = match stmt.query_map(params![session_key], |row| {
-            Ok(ChatMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        rows.filter_map(|r| r.ok()).collect()
+        Self::load_messages(&conn, session_key).unwrap_or_default()
     }
 
     fn load_with_timestamps(
@@ -302,27 +340,64 @@ impl SessionBackend for SqliteSessionBackend {
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let conn = self.conn.lock();
-        let now = Utc::now().to_rfc3339();
+        Self::append_message(&conn, session_key, message)
+    }
 
-        conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
-        )
-        .map_err(std::io::Error::other)?;
+    fn load_if_owned(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(std::io::Error::other)?;
+        let Some((owner_agent, owner_channel)) =
+            Self::session_ownership(&transaction, session_key)?
+        else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            owner_agent.as_deref(),
+            owner_channel.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        let messages = Self::load_messages(&transaction, session_key)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(ScopedSessionAccess::Granted(messages))
+    }
 
-        // Upsert metadata
-        conn.execute(
-            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
-             VALUES (?1, ?2, ?3, 1)
-             ON CONFLICT(session_key) DO UPDATE SET
-                last_activity = excluded.last_activity,
-                message_count = message_count + 1",
-            params![session_key, now, now],
-        )
-        .map_err(std::io::Error::other)?;
-
-        Ok(())
+    fn append_if_owned(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let Some((owner_agent, owner_channel)) =
+            Self::session_ownership(&transaction, session_key)?
+        else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            owner_agent.as_deref(),
+            owner_channel.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        Self::append_message(&transaction, session_key, message)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(ScopedSessionAccess::Granted(()))
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {

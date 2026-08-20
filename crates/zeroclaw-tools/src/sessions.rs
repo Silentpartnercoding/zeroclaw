@@ -8,7 +8,10 @@ use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
-use zeroclaw_infra::session_backend::{SessionBackend, SessionMetadata};
+use zeroclaw_infra::session_backend::{
+    ScopedSessionAccess, SessionBackend, SessionMetadata, SessionOwnershipDenial,
+    check_session_ownership,
+};
 
 static SESSIONS_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
 static SESSIONS_HISTORY_DESCRIPTION: OnceLock<String> = OnceLock::new();
@@ -103,43 +106,48 @@ impl SessionOwnershipScope {
             ));
         };
 
-        if let Some(owner) = metadata.agent_alias.as_deref() {
-            if owner == self.agent_alias {
-                return Ok(session_key);
-            }
-            return Err(format!(
+        check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            &self.agent_alias,
+            &self.channel_ids,
+        )
+        .map(|()| session_key)
+        .map_err(|denial| self.denial_message(session_id, &denial))
+    }
+
+    fn denial_message(&self, session_id: &str, denial: &SessionOwnershipDenial) -> String {
+        match denial {
+            SessionOwnershipDenial::ForeignAgent(owner) => format!(
                 "Session '{session_id}' is owned by agent '{owner}', not '{}'.",
                 self.agent_alias
-            ));
-        }
-
-        if let Some(channel_id) = metadata.channel_id.as_deref() {
-            if self.channel_ids.contains(channel_id) {
-                return Ok(session_key);
-            }
-            return Err(format!(
+            ),
+            SessionOwnershipDenial::ForeignChannel(channel_id) => format!(
                 "Session '{session_id}' belongs to channel '{channel_id}', which is not owned by agent '{}'.",
                 self.agent_alias
-            ));
+            ),
+            SessionOwnershipDenial::Unattributed => format!(
+                "Session '{session_id}' has no agent or channel ownership metadata; refusing session operation from agent '{}'.",
+                self.agent_alias
+            ),
+            SessionOwnershipDenial::AtomicCheckUnavailable => format!(
+                "Session backend cannot atomically verify ownership for '{session_id}'; refusing session operation from agent '{}'.",
+                self.agent_alias
+            ),
         }
-
-        Err(format!(
-            "Session '{session_id}' has no agent or channel ownership metadata; refusing session operation from agent '{}'.",
-            self.agent_alias
-        ))
     }
 
     /// Non-erroring form of the same three-tier ownership predicate, for
     /// filtering listings: agent match, else owned-channel match, else not
     /// owned (unattributed sessions are not owned by anyone).
     fn owns_metadata(&self, metadata: &SessionMetadata) -> bool {
-        if let Some(owner) = metadata.agent_alias.as_deref() {
-            return owner == self.agent_alias;
-        }
-        if let Some(channel_id) = metadata.channel_id.as_deref() {
-            return self.channel_ids.contains(channel_id);
-        }
-        false
+        check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            &self.agent_alias,
+            &self.channel_ids,
+        )
+        .is_ok()
     }
 }
 
@@ -353,21 +361,38 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
-        let target_session_key = match &self.ownership_scope {
-            Some(scope) => match scope.authorize(self.backend.as_ref(), session_id) {
-                Ok(key) => key,
-                Err(error) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(error),
-                    });
+        let messages = match &self.ownership_scope {
+            Some(scope) => {
+                let target_session_key =
+                    resolve_existing_session_key(self.backend.as_ref(), session_id)
+                        .unwrap_or_else(|| session_id.trim().to_string());
+                match self.backend.load_if_owned(
+                    &target_session_key,
+                    &scope.agent_alias,
+                    &scope.channel_ids,
+                ) {
+                    Ok(ScopedSessionAccess::Granted(messages)) => messages,
+                    Ok(ScopedSessionAccess::Missing) => Vec::new(),
+                    Ok(ScopedSessionAccess::Denied(denial)) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(scope.denial_message(session_id, &denial)),
+                        });
+                    }
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Failed to read session '{session_id}' after ownership verification: {error}"
+                            )),
+                        });
+                    }
                 }
-            },
-            None => session_id.to_string(),
+            }
+            None => self.backend.load(session_id),
         };
-
-        let messages = self.backend.load(&target_session_key);
 
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -511,19 +536,6 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        // Authorize before resolving so a foreign session is denied with an
-        // ownership error rather than written to. Nonexistent sessions pass
-        // authorization untouched and keep the not-found error below.
-        if let Some(scope) = &self.ownership_scope
-            && let Err(error) = scope.authorize(self.backend.as_ref(), session_id)
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(error),
-            });
-        }
-
         let Some(target_session_key) =
             resolve_existing_session_key(self.backend.as_ref(), session_id)
         else {
@@ -537,9 +549,21 @@ impl Tool for SessionsSendTool {
         };
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
+        let access = match &self.ownership_scope {
+            Some(scope) => self.backend.append_if_owned(
+                &target_session_key,
+                &chat_msg,
+                &scope.agent_alias,
+                &scope.channel_ids,
+            ),
+            None => self
+                .backend
+                .append(&target_session_key, &chat_msg)
+                .map(|()| ScopedSessionAccess::Granted(())),
+        };
 
-        match self.backend.append(&target_session_key, &chat_msg) {
-            Ok(()) => {
+        match access {
+            Ok(ScopedSessionAccess::Granted(())) => {
                 let output = if target_session_key == session_id.trim() {
                     format!("Message sent to session '{target_session_key}'.")
                 } else {
@@ -551,6 +575,24 @@ impl Tool for SessionsSendTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                })
+            }
+            Ok(ScopedSessionAccess::Missing) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
+                )),
+            }),
+            Ok(ScopedSessionAccess::Denied(denial)) => {
+                let error = self.ownership_scope.as_ref().map_or_else(
+                    || "Session ownership check failed unexpectedly.".to_string(),
+                    |scope| scope.denial_message(session_id, &denial),
+                );
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
                 })
             }
             Err(e) => Ok(ToolResult {
@@ -950,6 +992,58 @@ mod tests {
             self.inner.append(key, msg)
         }
 
+        fn load_if_owned(
+            &self,
+            key: &str,
+            agent_alias: &str,
+            channel_ids: &BTreeSet<String>,
+        ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+            let metadata = self.metadata.lock().unwrap();
+            let Some(session) = metadata
+                .get(key)
+                .cloned()
+                .or_else(|| self.inner.get_session_metadata(key))
+            else {
+                return Ok(ScopedSessionAccess::Missing);
+            };
+            if let Err(denial) = check_session_ownership(
+                session.agent_alias.as_deref(),
+                session.channel_id.as_deref(),
+                agent_alias,
+                channel_ids,
+            ) {
+                return Ok(ScopedSessionAccess::Denied(denial));
+            }
+            Ok(ScopedSessionAccess::Granted(self.inner.load(key)))
+        }
+
+        fn append_if_owned(
+            &self,
+            key: &str,
+            msg: &ChatMessage,
+            agent_alias: &str,
+            channel_ids: &BTreeSet<String>,
+        ) -> std::io::Result<ScopedSessionAccess<()>> {
+            let metadata = self.metadata.lock().unwrap();
+            let Some(session) = metadata
+                .get(key)
+                .cloned()
+                .or_else(|| self.inner.get_session_metadata(key))
+            else {
+                return Ok(ScopedSessionAccess::Missing);
+            };
+            if let Err(denial) = check_session_ownership(
+                session.agent_alias.as_deref(),
+                session.channel_id.as_deref(),
+                agent_alias,
+                channel_ids,
+            ) {
+                return Ok(ScopedSessionAccess::Denied(denial));
+            }
+            self.inner.append(key, msg)?;
+            Ok(ScopedSessionAccess::Granted(()))
+        }
+
         fn remove_last(&self, key: &str) -> std::io::Result<bool> {
             self.inner.remove_last(key)
         }
@@ -999,6 +1093,70 @@ mod tests {
         fn session_exists(&self, session_key: &str) -> bool {
             self.metadata.lock().unwrap().contains_key(session_key)
                 || self.inner.session_exists(session_key)
+        }
+    }
+
+    /// Test seam that pauses immediately before session access. The historical
+    /// implementation reached `load` or `append` only after a separate metadata
+    /// authorization, so this barrier deterministically opened its check/use
+    /// window. The ownership-conditional methods instead resume into one stable
+    /// backend operation.
+    struct PauseBeforeAccessBackend {
+        inner: Arc<dyn SessionBackend>,
+        access_ready: std::sync::mpsc::SyncSender<()>,
+        resume_access: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PauseBeforeAccessBackend {
+        fn pause(&self) {
+            self.access_ready.send(()).unwrap();
+            self.resume_access.lock().unwrap().recv().unwrap();
+        }
+    }
+
+    impl SessionBackend for PauseBeforeAccessBackend {
+        fn load(&self, key: &str) -> Vec<ChatMessage> {
+            self.pause();
+            self.inner.load(key)
+        }
+
+        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.pause();
+            self.inner.append(key, msg)
+        }
+
+        fn load_if_owned(
+            &self,
+            key: &str,
+            agent_alias: &str,
+            channel_ids: &BTreeSet<String>,
+        ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+            self.pause();
+            self.inner.load_if_owned(key, agent_alias, channel_ids)
+        }
+
+        fn append_if_owned(
+            &self,
+            key: &str,
+            msg: &ChatMessage,
+            agent_alias: &str,
+            channel_ids: &BTreeSet<String>,
+        ) -> std::io::Result<ScopedSessionAccess<()>> {
+            self.pause();
+            self.inner
+                .append_if_owned(key, msg, agent_alias, channel_ids)
+        }
+
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.inner.remove_last(key)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            self.inner.list_sessions()
+        }
+
+        fn get_session_metadata(&self, key: &str) -> Option<SessionMetadata> {
+            self.inner.get_session_metadata(key)
         }
     }
 
@@ -1621,6 +1779,119 @@ mod tests {
         assert!(result.success);
         let messages = backend.load("telegram__alice");
         assert_eq!(messages.last().unwrap().content, "own-session message");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_rechecks_ownership_atomically_after_concurrent_reassignment() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = TempDir::new().unwrap();
+            let inner = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            inner
+                .append("gw_shared", &ChatMessage::user("agent_a private history"))
+                .unwrap();
+            inner
+                .set_session_agent_alias("gw_shared", "agent_a")
+                .unwrap();
+
+            let (access_ready, access_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_access) = std::sync::mpsc::sync_channel(0);
+            let backend: Arc<dyn SessionBackend> = Arc::new(PauseBeforeAccessBackend {
+                inner: Arc::clone(&inner),
+                access_ready,
+                resume_access: Mutex::new(resume_access),
+            });
+            let tool = SessionsHistoryTool::for_agent(
+                backend,
+                test_security(),
+                SessionOwnershipScope::for_agent("agent_a"),
+            );
+
+            let task = zeroclaw_spawn::spawn!(async move {
+                tool.execute(json!({"session_id": "shared"})).await.unwrap()
+            });
+            access_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("history must pause immediately before backend access");
+            inner
+                .set_session_agent_alias("gw_shared", "agent_b")
+                .unwrap();
+            inner
+                .append("gw_shared", &ChatMessage::user("agent_b private history"))
+                .unwrap();
+            resume_tx.send(()).unwrap();
+
+            let result = task.await.unwrap();
+            assert!(!result.success, "backend={backend_name}: {result:?}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("owned by agent 'agent_b'")),
+                "backend={backend_name}: {result:?}"
+            );
+            assert!(!result.output.contains("agent_b private history"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_rechecks_ownership_atomically_after_concurrent_reassignment() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = TempDir::new().unwrap();
+            let inner = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            inner
+                .append("gw_shared", &ChatMessage::user("existing message"))
+                .unwrap();
+            inner
+                .set_session_agent_alias("gw_shared", "agent_a")
+                .unwrap();
+
+            let (access_ready, access_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_access) = std::sync::mpsc::sync_channel(0);
+            let backend: Arc<dyn SessionBackend> = Arc::new(PauseBeforeAccessBackend {
+                inner: Arc::clone(&inner),
+                access_ready,
+                resume_access: Mutex::new(resume_access),
+            });
+            let tool = SessionsSendTool::for_agent(
+                backend,
+                test_security(),
+                SessionOwnershipScope::for_agent("agent_a"),
+            );
+
+            let task = zeroclaw_spawn::spawn!(async move {
+                tool.execute(json!({
+                    "session_id": "shared",
+                    "message": "must not cross ownership"
+                }))
+                .await
+                .unwrap()
+            });
+            access_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("send must pause immediately before backend access");
+            inner
+                .set_session_agent_alias("gw_shared", "agent_b")
+                .unwrap();
+            resume_tx.send(()).unwrap();
+
+            let result = task.await.unwrap();
+            assert!(!result.success, "backend={backend_name}: {result:?}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("owned by agent 'agent_b'")),
+                "backend={backend_name}: {result:?}"
+            );
+            let messages = inner.load("gw_shared");
+            assert_eq!(messages.len(), 1, "backend={backend_name}");
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message.content != "must not cross ownership"),
+                "backend={backend_name}: {messages:?}"
+            );
+        }
     }
 
     #[tokio::test]
