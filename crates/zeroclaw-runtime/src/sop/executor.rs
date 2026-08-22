@@ -151,7 +151,40 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
 
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
-const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+
+/// Terminalize a run whose driver consumed `MAX_HEADLESS_DRIVE_STEPS`, and log
+/// the outcome. Shared by every driver — the two headless ones here and the
+/// live agent turn — so all three agree on the bound and on who owns the
+/// durable failure when it is hit.
+pub(crate) fn fail_exhausted_step_budget(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    let terminal = {
+        let mut guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.fail_headless_step_budget(run_id)
+    };
+    match terminal {
+        Ok(_) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "SOP driver: step budget exhausted; run failed"
+        ),
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "SOP driver: failed to persist step-budget terminal state"
+        ),
+    }
+}
 
 /// Drive deterministic actions through a shared engine without retaining its
 /// mutex across step boundaries.
@@ -461,32 +494,7 @@ async fn drive_headless_run(
         | SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
         _ => return,
     };
-    let terminal = {
-        let mut guard = match engine.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.fail_headless_step_budget(&run_id)
-    };
-    match terminal {
-        Ok(_) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"run_id": run_id})),
-            "SOP headless driver: step budget exhausted; run failed"
-        ),
-        Err(e) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "run_id": run_id,
-                    "error": e.to_string(),
-                })),
-            "SOP headless driver: failed to persist step-budget terminal state"
-        ),
-    }
+    fail_exhausted_step_budget(&engine, &run_id);
 }
 
 pub(crate) fn advance_sop_step(
