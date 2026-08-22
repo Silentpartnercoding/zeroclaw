@@ -18,6 +18,12 @@ use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
 use crate::runner::RunDeps;
 
+/// The model name `Agent::builder()` falls back to when no `model_name` is set.
+///
+/// Mirrors the runtime builder default so the capability probe below asks the
+/// provider about the same string the agent will really dispatch with.
+const UNCONFIGURED_MODEL: &str = "<unconfigured>";
+
 /// Intersect a case's requested tools with the config allowlist, preserving the
 /// allowlist's order and de-duplicating. An empty allowlist yields no tools.
 pub fn effective_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
@@ -124,8 +130,15 @@ pub async fn run_live_case(
     let provider = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
-    let dispatcher =
-        tool_dispatcher_for_provider(&AliasedAgentConfig::default(), provider.as_ref());
+    // `capabilities_for_model` is model-aware (a composite/routing provider can
+    // report different capabilities per model), so it must be asked about the
+    // same model the built agent will actually dispatch with. The builder below
+    // sets no `model_name`, so that is the `Agent::builder()` default.
+    let dispatcher = tool_dispatcher_for_provider(
+        &AliasedAgentConfig::default(),
+        provider.as_ref(),
+        UNCONFIGURED_MODEL,
+    );
 
     let mut agent = Agent::builder()
         .model_provider(provider)
