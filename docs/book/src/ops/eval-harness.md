@@ -49,8 +49,8 @@ case to a `<testcase>`: a failing case becomes a `<failure>`, a run error an
 Every accepted flag combination emits exactly one document in the requested
 format. In particular `--format junit --write-baseline <file>` writes the
 baseline **and** renders the report: a baseline refresh has no prior baseline to
-diff against, so it is rendered with an explicit *no-comparison* policy — no case
-is `<skipped/>`, because nothing was compared.
+diff against, so it is rendered with an explicit *no-comparison* policy: no
+case is `<skipped/>`, because nothing was compared.
 
 A live case classified `flaky-unconfirmed` (it regressed against the baseline but
 passed on its single re-run) renders as `<skipped/>` with a `message` naming the
@@ -61,10 +61,11 @@ contradiction.
 
 > ⚠️ **JUnit failure bodies can carry model output.** A failed `response_contains`
 > check reports what the model actually produced, so the complete final response
-> can land in a `<failure>` or `<system-out>` body — and CI reporters retain those
-> as build artifacts and PR annotations, often with wider visibility than the raw
-> logs. XML escaping protects document structure, not confidentiality. Treat a
-> JUnit artifact with the same care as a record dump (see *Record dumps* below),
+> can land in a `<failure>` or `<system-out>` body, and CI reporters retain
+> those as build artifacts and PR annotations, often with wider visibility than
+> the raw logs. XML escaping protects document structure, not confidentiality.
+> Treat a JUnit artifact with the same care as a record dump (see *Record dumps*
+> below),
 > and do not publish it from a suite whose fixtures or provider responses carry
 > sensitive content.
 
@@ -185,7 +186,7 @@ per-case `score` and `category_totals`.
 
 Unknown keys are **rejected** at fixture load, in `expects` and in the trace
 around it. A misspelled key would otherwise be silently discarded, leaving the
-case with no graded checks — and a case with no checks passes vacuously, so a
+case with no graded checks, and a case with no checks passes vacuously, so a
 typo in a new assertion would delete the assertion instead of failing loudly. A
 suite containing such a fixture now fails to load, naming the file and the
 offending key. A deliberately empty `"expects": {}` block is still valid and
