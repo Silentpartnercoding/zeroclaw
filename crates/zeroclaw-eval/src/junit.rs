@@ -250,11 +250,7 @@ mod tests {
         }
     }
 
-    fn attr<'a>(
-        elements: &'a [Element],
-        element: &str,
-        key: &str,
-    ) -> Option<&'a str> {
+    fn attr<'a>(elements: &'a [Element], element: &str, key: &str) -> Option<&'a str> {
         elements
             .iter()
             .find(|(name, _)| name == element)?

@@ -25,7 +25,7 @@ pub struct FinalizeOpts {
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
 /// the process exit code. Kept together so `main` only wires flags.
 ///
-/// Every accepted path converges on the single [`emit_report`] call at the end,
+/// Every accepted path converges on the single `emit_report` call at the end,
 /// so no flag combination can drop the requested output format.
 pub async fn finalize(
     config: &Config,
