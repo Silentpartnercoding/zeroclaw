@@ -12,7 +12,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
 
-type MutationLock = parking_lot::Mutex<()>;
+#[derive(Default)]
+pub(crate) struct MutationState {
+    migrated: bool,
+    receipt_state_uncertain: bool,
+}
 
 const SESSION_FILE_SUFFIX: &str = ".jsonl";
 const METADATA_FILE_SUFFIX: &str = ".metadata.json";
@@ -21,15 +25,57 @@ const METADATA_FILE_SUFFIX: &str = ".metadata.json";
 /// Message count and timestamps remain derived from the session files at read
 /// time so the JSONL backend does not duplicate them in a second source.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct JsonlSessionMetadata {
-    name: Option<String>,
-    agent_alias: Option<String>,
-    channel_id: Option<String>,
-    room_id: Option<String>,
-    sender_id: Option<String>,
+pub(crate) struct JsonlSessionMetadata {
+    pub(crate) name: Option<String>,
+    pub(crate) agent_alias: Option<String>,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) room_id: Option<String>,
+    pub(crate) sender_id: Option<String>,
 }
 
-static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
+fn metadata_sidecar_path(sessions_dir: &Path, session_key: &str) -> PathBuf {
+    sessions_dir.join(format!(
+        "{}{METADATA_FILE_SUFFIX}",
+        sanitize_session_key(session_key)
+    ))
+}
+
+/// Read a session's ownership sidecar without taking the per-directory
+/// mutation lock. SQLite migration already holds that lock for the whole
+/// handoff, so it must not re-enter it through `SessionStore`.
+pub(crate) fn read_metadata_sidecar(
+    sessions_dir: &Path,
+    session_key: &str,
+) -> std::io::Result<Option<JsonlSessionMetadata>> {
+    match std::fs::File::open(metadata_sidecar_path(sessions_dir, session_key)) {
+        Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Archive a session's ownership sidecar alongside its migrated JSONL file.
+pub(crate) fn mark_metadata_sidecar_migrated(
+    sessions_dir: &Path,
+    session_key: &str,
+) -> std::io::Result<()> {
+    let path = metadata_sidecar_path(sessions_dir, session_key);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::rename(&path, path.with_extension("json.migrated"))
+}
+
+pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
+
+struct MutationLockRecord {
+    lock: Weak<MutationLock>,
+    migrated: bool,
+}
+
+static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, MutationLockRecord>>> =
     OnceLock::new();
 
 /// Append-only JSONL session store for channel conversations.
@@ -44,6 +90,19 @@ impl SessionStore {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
+        {
+            let mut state = mutation_lock.lock();
+            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+                Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
+                Ok(false) => state.receipt_state_uncertain = false,
+                Err(error) => {
+                    state.receipt_state_uncertain = true;
+                    return Err(std::io::Error::other(format!(
+                        "Failed to inspect durable JSONL migration state: {error:#}"
+                    )));
+                }
+            }
+        }
         Ok(Self {
             sessions_dir,
             mutation_lock,
@@ -94,7 +153,7 @@ impl SessionStore {
     where
         F: FnOnce(&mut JsonlSessionMetadata),
     {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         self.update_metadata_unlocked(session_key, update)
     }
 
@@ -150,14 +209,6 @@ impl SessionStore {
         })
     }
 
-    pub(crate) fn mark_metadata_migrated(&self, session_key: &str) -> std::io::Result<()> {
-        let path = self.metadata_path(session_key);
-        if !path.exists() {
-            return Ok(());
-        }
-        std::fs::rename(&path, path.with_extension("json.migrated"))
-    }
-
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
@@ -186,8 +237,18 @@ impl SessionStore {
 
     /// Append a single message to the session JSONL file.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
+    }
+
+    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
+        let guard = self.mutation_lock.lock();
+        if guard.migrated || guard.receipt_state_uncertain {
+            return Err(std::io::Error::other(
+                "JSONL session store is inactive after SQLite migration",
+            ));
+        }
+        Ok(guard)
     }
 
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
@@ -208,7 +269,7 @@ impl SessionStore {
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -234,7 +295,7 @@ impl SessionStore {
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         let Some(last) = messages.last_mut() else {
             return Ok(false);
@@ -246,7 +307,7 @@ impl SessionStore {
 
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
@@ -281,7 +342,7 @@ impl SessionStore {
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -291,7 +352,7 @@ impl SessionStore {
 
     /// Delete a session's JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
         let metadata_path = self.metadata_path(session_key);
         let existed = path.exists() || metadata_path.exists();
@@ -335,19 +396,62 @@ impl SessionStore {
     }
 }
 
-fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
+pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
     let key = sessions_dir.canonicalize()?;
     let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut locks = registry.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
+    locks.retain(|_, record| record.migrated || record.lock.strong_count() > 0);
 
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(|record| record.lock.upgrade()) {
         return Ok(lock);
     }
 
-    let lock = Arc::new(MutationLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
+    let migrated = locks.get(&key).is_some_and(|record| record.migrated);
+    let lock = Arc::new(MutationLock::new(MutationState {
+        migrated,
+        receipt_state_uncertain: false,
+    }));
+    locks.insert(
+        key,
+        MutationLockRecord {
+            lock: Arc::downgrade(&lock),
+            migrated,
+        },
+    );
     Ok(lock)
+}
+
+pub(crate) fn mark_session_directory_migrated(
+    sessions_dir: &Path,
+    state: &mut MutationState,
+) -> std::io::Result<()> {
+    state.migrated = true;
+    state.receipt_state_uncertain = false;
+    let key = sessions_dir.canonicalize()?;
+    let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(record) = registry.lock().get_mut(&key) {
+        record.migrated = true;
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = true;
+}
+
+pub(crate) fn clear_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = false;
+}
+
+#[cfg(test)]
+pub(crate) fn forget_session_directory_migration_state_for_test(
+    sessions_dir: &Path,
+) -> std::io::Result<()> {
+    let key = sessions_dir.canonicalize()?;
+    if let Some(registry) = MUTATION_LOCKS.get() {
+        registry.lock().remove(&key);
+    }
+    Ok(())
 }
 
 impl SessionBackend for SessionStore {
@@ -387,7 +491,7 @@ impl SessionBackend for SessionStore {
         agent_alias: &str,
         channel_ids: &BTreeSet<String>,
     ) -> std::io::Result<ScopedSessionAccess<()>> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let Some(metadata) = self.metadata_for_session(session_key) else {
             return Ok(ScopedSessionAccess::Missing);
         };
@@ -435,7 +539,7 @@ impl SessionBackend for SessionStore {
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut updated = 0;
         for key in self.list_sessions() {
             let Some(metadata) = self.read_metadata(&key)? else {
@@ -451,7 +555,7 @@ impl SessionBackend for SessionStore {
     }
 
     fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut updated = 0;
         for key in self.list_sessions() {
             let Some(metadata) = self.read_metadata(&key)? else {
