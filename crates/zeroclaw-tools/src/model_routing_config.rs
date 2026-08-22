@@ -804,6 +804,19 @@ impl ModelRoutingConfigTool {
             entry.api_key = Some(api_key);
         }
 
+        // Probe the model the post-reload runtime will actually serve. A
+        // `ZEROCLAW_*` override on the alias's `model` field is authoritative
+        // in memory after load, so probing the saved value would validate a
+        // model the runtime never uses — and could roll the disk change back
+        // over a model that was never going to be served.
+        let effective_model = effective
+            .providers
+            .models
+            .find(family, alias)
+            .and_then(|e| e.model.clone())
+            .filter(|value| !value.trim().is_empty());
+        let probe_model_name = effective_model.as_deref().unwrap_or(model);
+
         let model_provider =
             zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name)
                 .map_err(ProbeFailure::Construction)?;
@@ -814,7 +827,7 @@ impl ModelRoutingConfigTool {
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
-                model,
+                probe_model_name,
                 Some(PING_TEMPERATURE),
             )
             .await
@@ -1923,6 +1936,83 @@ mod tests {
             Some("https://env.invalid/v1"),
             "the representative runtime option resolved for the probe must also be \
              environment-effective"
+        );
+    }
+
+    /// The environment layer is the in-memory authority after load, so an
+    /// alias `model` override decides what the post-reload runtime serves.
+    /// Probing the saved disk value instead would validate — or roll back
+    /// over — a model that is never dispatched.
+    #[tokio::test]
+    async fn probe_model_dispatches_the_env_effective_alias_model_not_the_saved_one() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // A test-owned alias, so the process-wide env var below cannot
+        // collide with another test's alias.
+        const ALIAS: &str = "probe_env_model_case";
+
+        let server = MockServer::start().await;
+        // Match on the verb alone: the assertion below is about the dispatched
+        // `model`, and pinning the alias's endpoint shape here would make this
+        // regression fail for an unrelated provider-route change.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Disk says `gpt-disk`. A custom `uri` points the probe at the mock
+        // and disables the factory's key-prefix pre-flight, so the request is
+        // actually dispatched and its body is observable.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-disk-key".to_string());
+            entry.model = Some("gpt-disk".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+
+        let model_var = "ZEROCLAW_providers__models__openai__probe_env_model_case__model";
+        // SAFETY: this test owns this env-var key and removes it below. The
+        // value is a synthetic model name, not a credential.
+        unsafe { std::env::set_var(model_var, "gpt-env") };
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        let probe = tool
+            .probe_model(&saved, &format!("openai.{ALIAS}"), "gpt-disk")
+            .await;
+
+        // SAFETY: undo the test-only process env mutation above.
+        unsafe { std::env::remove_var(model_var) };
+
+        assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the probe dispatches exactly one request"
+        );
+        let body: serde_json::Value = requests[0]
+            .body_json()
+            .expect("the probe sends a JSON chat request");
+        assert_eq!(
+            body["model"].as_str(),
+            Some("gpt-env"),
+            "the probe must dispatch the environment-effective alias model; probing the saved \
+             `gpt-disk` would validate a model the post-reload runtime never serves"
         );
     }
 
