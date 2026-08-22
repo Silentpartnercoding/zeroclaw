@@ -41,6 +41,13 @@ mod component {
 
         fn configure(config: String) -> Result<(), String> {
             let parsed: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
+            // Typed-config contract: the host must deliver `retry_count` as a
+            // JSON integer, not the operator's raw string. Checked on the
+            // parsed value rather than the serialized text so an additional
+            // property (and any key ordering) does not break the assertion.
+            if parsed["retry_count"].as_u64() != Some(5) {
+                return Err("expected typed retry_count config".to_string());
+            }
             if let Some(handle) = parsed["handle"].as_str() {
                 *CONFIGURED_HANDLE.lock().unwrap() = Some(handle.to_string());
             }

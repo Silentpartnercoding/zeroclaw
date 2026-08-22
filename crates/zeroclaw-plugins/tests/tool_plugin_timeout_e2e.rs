@@ -2,7 +2,6 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use zeroclaw_plugins::component::PluginLimits;
+use zeroclaw_plugins::config::{ResolvedPluginConfig, resolve_plugin_config};
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
@@ -62,11 +62,20 @@ fn limits(call_timeout: Duration, call_fuel: u64) -> PluginLimits {
     }
 }
 
-async fn plugin(call_timeout: Duration) -> runtime::Plugin {
+/// A warm fixture plugin paired with the resolved config view its scope
+/// admits. `call_execute` now takes the typed, scope-bound config rather than
+/// a raw string map, and the view must come from the *same* scope issuance the
+/// instance was created with, so the two are carried together.
+struct Fixture {
+    plugin: runtime::Plugin,
+    config: ResolvedPluginConfig,
+}
+
+async fn plugin(call_timeout: Duration) -> Fixture {
     plugin_with_fuel(call_timeout, 1_000_000_000).await
 }
 
-async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> runtime::Plugin {
+async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> Fixture {
     let temp = tempfile::tempdir().expect("temp plugin root");
     let plugin_dir = temp.path().join("tool-timeout-fixture");
     std::fs::create_dir_all(&plugin_dir).expect("create plugin directory");
@@ -93,9 +102,14 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> runtime::Pl
         manifest.permissions.iter().copied(),
     )
     .expect("admit fixture scope");
-    runtime::create_plugin(path, &scope, limits(call_timeout, call_fuel))
+    // The fixture manifest declares no `config_schema` and does not request
+    // `config_read`, so this resolves to the empty object the guest expects.
+    let config = resolve_plugin_config(manifest, &scope, None)
+        .expect("fixture manifest resolves an empty config section");
+    let plugin = runtime::create_plugin(path, &scope, limits(call_timeout, call_fuel))
         .await
-        .expect("instantiate timeout fixture")
+        .expect("instantiate timeout fixture");
+    Fixture { plugin, config }
 }
 
 /// Spawn a one-request server. The returned receiver resolves once the
@@ -158,13 +172,13 @@ enum ServerResponse {
 }
 
 async fn execute(
-    plugin: &mut runtime::Plugin,
+    fixture: &mut Fixture,
     value: serde_json::Value,
 ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
     runtime::call_execute(
-        plugin,
+        &mut fixture.plugin,
         &serde_json::to_vec(&value).expect("serialize fixture input"),
-        &HashMap::new(),
+        &fixture.config,
     )
     .await
 }

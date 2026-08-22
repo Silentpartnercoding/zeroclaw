@@ -17,10 +17,11 @@ use tokio::net::TcpListener;
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
-use zeroclaw_plugins::{PluginCapability, PluginManifest};
+use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -81,6 +82,13 @@ async fn channel_with(
     config: &HashMap<String, String>,
     limits: PluginLimits,
 ) -> WasmChannel {
+    // The manifest declares a config_schema with a required property, so the
+    // grant must always be present: without ConfigRead the resolver withholds
+    // the section and the empty object fails schema validation.
+    let mut permissions = permissions;
+    if !permissions.contains(&PluginPermission::ConfigRead) {
+        permissions.push(PluginPermission::ConfigRead);
+    }
     let manifest = PluginManifest {
         name: "channel-fixture".to_string(),
         version: "0.0.0".to_string(),
@@ -88,7 +96,20 @@ async fn channel_with(
         author: None,
         wasm_path: Some("channel-fixture.wasm".to_string()),
         capabilities: vec![PluginCapability::Channel],
+        // Every fixture channel is ConfigRead-granted so the typed-config
+        // contract master added is exercised on every instantiation; callers
+        // add whatever else their case needs (e.g. HttpClient).
         permissions,
+        config_schema: Some(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["retry_count"],
+            "additionalProperties": false,
+            "properties": {
+                "retry_count": {"type": "integer", "minimum": 1},
+                "handle": {"type": "string"}
+            }
+        })),
         signature: None,
         publisher_key: None,
     };
@@ -100,8 +121,13 @@ async fn channel_with(
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
+    let mut configured = HashMap::from([("retry_count".to_string(), "5".to_string())]);
+    configured.extend(config.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let config = PluginConfigResolver::new(move |scope| {
+        resolve_plugin_config(&manifest, scope, Some(&configured))
+    });
 
-    WasmChannel::from_wasm(endpoint, &fixture(), config, limits)
+    WasmChannel::from_wasm(endpoint, &fixture(), &config, limits)
         .await
         .expect("instantiate fixture channel")
 }

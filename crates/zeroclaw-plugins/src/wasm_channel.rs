@@ -1,7 +1,6 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 
-use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
@@ -13,11 +12,10 @@ use crate::component::{
     PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_store, engine,
     load_component, wt, wt_instantiate,
 };
+use crate::config::{PluginConfigResolver, ResolvedPluginConfig};
 use crate::endpoint::PluginChannelEndpoint;
-use crate::instance::PluginGrantSet;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -46,15 +44,15 @@ pub struct WasmChannel {
 
 struct ChannelInstanceFactory {
     component: Component,
-    /// Generation-scoped `configure` snapshot. Resolved once at construction
-    /// under the scope's `ConfigRead` grant and replayed verbatim when an
-    /// interrupted instance is reconstructed, so a rebuilt instance can never
-    /// observe different config than the one whose cached metadata it must
-    /// match. When the grant is present this may hold channel secrets in
+    /// Generation-scoped `configure` snapshot. Resolved and validated once at
+    /// construction under the scope's `ConfigRead` grant and replayed verbatim
+    /// when an interrupted instance is reconstructed, so a rebuilt instance can
+    /// never observe different config than the one whose cached metadata it
+    /// must match. When the grant is present this may hold channel secrets in
     /// plaintext for exactly as long as the owning [`WasmChannel`] lives:
     /// there is no live config handle to refresh, so a config reload must
     /// rebuild the channel, which discards this snapshot with it.
-    config_json: String,
+    config: ResolvedPluginConfig,
     limits: crate::component::PluginLimits,
 }
 
@@ -86,18 +84,6 @@ impl Attributable for WasmChannel {
     }
 }
 
-/// Resolve the JSON config section handed to a channel plugin's `configure`.
-/// Withheld (an empty object) unless the admitted scope grants `ConfigRead`, so a
-/// plugin without the permission can never be configured with another channel's
-/// secrets. Mirrors the tool-plugin `__config` rule.
-fn resolve_configure_json(config: &HashMap<String, String>, grants: &PluginGrantSet) -> String {
-    if grants.allows(PluginPermission::ConfigRead) {
-        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
-    }
-}
-
 fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
@@ -121,13 +107,19 @@ impl WasmChannel {
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
         wasm_path: &Path,
-        config: &HashMap<String, String>,
+        config: &PluginConfigResolver,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
+        // Resolve and validate the operator config before any guest code is
+        // loaded, so an invalid section rejects registration rather than
+        // reaching a running instance (master), and keep the resolved view as
+        // the generation-scoped snapshot the factory replays when it rebuilds
+        // an interrupted instance (this PR).
+        let config = config.resolve(endpoint.scope())?;
         let inbound = InboundQueue::default();
         let factory = ChannelInstanceFactory {
             component: load_component(wasm_path)?,
-            config_json: resolve_configure_json(config, endpoint.scope().grants()),
+            config,
             limits,
         };
         let instance = factory.instantiate(&endpoint, inbound.clone()).await?;
@@ -203,11 +195,13 @@ impl ChannelInstanceFactory {
         // section is withheld unless the admitted scope grants `ConfigRead`, matching
         // the tool-plugin `__config` rule, so a plugin without the permission is
         // configured with an empty object rather than another channel's secrets.
+        self.config.ensure_scope(store.data().scope())?;
+        let config_json = serde_json::to_string(self.config.as_json())?;
         call_store!(store, async |store: &mut Store<PluginState>| {
             wt(
                 bindings
                     .zeroclaw_plugin_channel()
-                    .call_configure(store, &self.config_json)
+                    .call_configure(store, &config_json)
                     .await,
                 "channel.configure trapped",
             )?
@@ -888,31 +882,26 @@ mod tests {
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
     }
 
-    #[test]
-    fn configure_withholds_section_without_config_read() {
-        let mut config = HashMap::new();
-        config.insert("api_key".to_string(), "secret".to_string());
-        let scope = crate::instance::test_scope(
-            PluginCapability::Channel,
-            "main",
-            [PluginPermission::HttpClient],
-        );
-        let json = resolve_configure_json(&config, scope.grants());
-        assert_eq!(json, "{}", "no ConfigRead means an empty config object");
-    }
+    #[tokio::test]
+    async fn channel_validates_config_before_loading_guest_code() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
+        let config = PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-before-load".to_string(),
+            ))
+        });
+        let error = WasmChannel::from_wasm(
+            endpoint,
+            Path::new("/path/that/must/not/exist.wasm"),
+            &config,
+            crate::component::test_limits(0),
+        )
+        .await
+        .err()
+        .expect("invalid config must reject registration");
 
-    #[test]
-    fn configure_passes_section_with_config_read() {
-        let mut config = HashMap::new();
-        config.insert("identity".to_string(), "on-call".to_string());
-        let scope = crate::instance::test_scope(
-            PluginCapability::Channel,
-            "main",
-            [PluginPermission::ConfigRead],
-        );
-        let json = resolve_configure_json(&config, scope.grants());
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["identity"], "on-call", "granted section round-trips");
+        assert!(error.to_string().contains("invalid-before-load"));
     }
 
     #[test]
