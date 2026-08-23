@@ -480,18 +480,7 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(
-    config_dir: &std::path::Path,
-    socket: &std::path::Path,
-) -> anyhow::Result<()> {
-    let mut cmd = ephemeral_daemon_command(config_dir, socket);
-    cmd.stderr(std::process::Stdio::null());
-    cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-    Ok(())
-}
-
-fn spawn_owned_ephemeral_daemon(
+pub(crate) fn spawn_owned_ephemeral_daemon(
     config_dir: &std::path::Path,
     socket: &std::path::Path,
 ) -> anyhow::Result<SpawnedDaemon> {
@@ -541,7 +530,7 @@ fn configure_ephemeral_daemon_command(
         .env("ZEROCLAW_SOCKET", socket);
 }
 
-struct SpawnedDaemon {
+pub(crate) struct SpawnedDaemon {
     child: std::process::Child,
     stderr: Arc<Mutex<std::collections::VecDeque<u8>>>,
     capture_stderr: Arc<AtomicBool>,
@@ -628,8 +617,12 @@ impl SpawnedDaemon {
         self.child.try_wait()
     }
 
-    fn id(&self) -> u32 {
+    pub(crate) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    pub(crate) fn has_exited(&mut self) -> anyhow::Result<bool> {
+        Ok(self.poll_exit()?.is_some())
     }
 
     fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
@@ -663,7 +656,7 @@ impl SpawnedDaemon {
         sanitize_daemon_stderr(&bytes)
     }
 
-    fn detach(mut self) {
+    pub(crate) fn detach(mut self) {
         self.cleanup_on_drop = false;
         self.capture_stderr.store(false, Ordering::Release);
         self.stderr_done.take();
@@ -914,6 +907,26 @@ mod connection_tests {
 
         assert!(!exit.status.success());
         assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn reconnect_identity_uses_the_actual_spawned_child_pid() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        let spawned_pid = daemon.id();
+
+        assert!(crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid),
+        ));
+        assert!(!crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid.wrapping_add(2)),
+        ));
+
+        daemon.terminate_and_wait().expect("terminate helper");
     }
 
     #[test]

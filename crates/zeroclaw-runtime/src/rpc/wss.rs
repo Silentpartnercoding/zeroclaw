@@ -29,6 +29,11 @@ const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 /// before declaring the peer dead and tearing the connection down.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Best-effort deadline for flushing a WebSocket Close frame during daemon
+/// cancellation. A suspended or black-holed peer must not retain the detached
+/// writer task and its TLS/socket resources indefinitely.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
@@ -62,6 +67,41 @@ enum Control {
     Ping,
 }
 
+async fn run_writer<S>(
+    mut sink: S,
+    mut writer_rx: mpsc::Receiver<String>,
+    mut control_rx: mpsc::Receiver<Control>,
+    cancel: CancellationToken,
+    close_timeout: Duration,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            line = writer_rx.recv() => match line {
+                Some(line) => Message::Text(line.into()),
+                None => break,
+            },
+            ctrl = control_rx.recv() => match ctrl {
+                Some(Control::Ping) => Message::Ping(Vec::new().into()),
+                None => break,
+            },
+        };
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = sink.send(msg) => result.is_ok(),
+        };
+        if !sent {
+            break;
+        }
+    }
+
+    let _ = tokio::time::timeout(close_timeout, sink.close()).await;
+}
+
 pub struct WssTransport {
     reader: futures_util::stream::SplitStream<WebSocketStream<TlsStream>>,
     writer_tx: mpsc::Sender<String>,
@@ -81,33 +121,14 @@ impl WssTransport {
         let peer_label = format!("wss:{remote_addr}");
         let (sink, stream) = ws.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let (control_tx, mut control_rx) = mpsc::channel::<Control>(8);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        let (control_tx, control_rx) = mpsc::channel::<Control>(8);
         zeroclaw_spawn::spawn!(async move {
-            let mut sink = sink;
             // Session approval channels and log forwarders retain writer
             // senders past disconnect, so channel closure alone cannot end
-            // this task. On cancellation, close the sink so the peer sees
-            // a Close frame instead of hanging on an abandoned daemon
-            // iteration.
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    line = writer_rx.recv() => match line {
-                        Some(line) => Message::Text(line.into()),
-                        None => break,
-                    },
-                    ctrl = control_rx.recv() => match ctrl {
-                        Some(Control::Ping) => Message::Ping(Vec::new().into()),
-                        None => break,
-                    },
-                };
-                if sink.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
+            // this task. Cancellation interrupts an in-flight send, then
+            // gives the Close-frame flush a bounded best-effort window.
+            run_writer(sink, writer_rx, control_rx, cancel, CLOSE_TIMEOUT).await;
         });
 
         Self {
@@ -327,8 +348,98 @@ pub async fn run_wss_listener(
 
 #[cfg(test)]
 mod accept_error_tests {
-    use super::is_recoverable_accept_error;
+    use super::{Control, is_recoverable_accept_error, run_writer};
+    use futures_util::StreamExt;
     use std::io::{Error, ErrorKind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_util::sync::CancellationToken;
+
+    struct NonReadingPeer {
+        write_polled: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for NonReadingPeer {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NonReadingPeer {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_polled.store(true, Ordering::Release);
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_bounds_send_and_close_for_non_reading_peer() {
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let websocket = WebSocketStream::from_raw_socket(
+            NonReadingPeer {
+                write_polled: Arc::clone(&write_polled),
+            },
+            Role::Server,
+            None,
+        )
+        .await;
+        let (sink, _stream) = websocket.split();
+        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::channel::<Control>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+
+        let writer = zeroclaw_spawn::spawn!(run_writer(
+            sink,
+            writer_rx,
+            control_rx,
+            writer_cancel,
+            Duration::from_millis(10),
+        ));
+        writer_tx.send("response".to_owned()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !write_polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the WebSocket sink should attempt the blocked network write");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(100), writer)
+            .await
+            .expect("cancellation and bounded Close must release the writer task")
+            .expect("writer task should not panic");
+    }
 
     #[cfg(unix)]
     #[test]

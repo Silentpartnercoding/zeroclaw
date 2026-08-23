@@ -391,6 +391,16 @@ fn should_respawn_ephemeral(
     !pid_alive(pid) || disconnected_for >= EPHEMERAL_RESPAWN_GRACE
 }
 
+pub(crate) fn reconnect_matches_owned_daemon(
+    owned_pid: Option<u32>,
+    pending_respawn_pid: Option<u32>,
+    server_pid: Option<u32>,
+) -> bool {
+    pending_respawn_pid
+        .or(owned_pid)
+        .is_none_or(|expected_pid| server_pid == Some(expected_pid))
+}
+
 /// Probe whether the owned daemon process still exists. `kill(pid, 0)`
 /// succeeds (or fails with EPERM) while the process is alive.
 #[cfg(unix)]
@@ -435,6 +445,7 @@ pub async fn run(
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
     let mut disconnected_at: Option<Instant> = None;
+    let mut pending_respawn: Option<crate::SpawnedDaemon> = None;
 
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
@@ -658,6 +669,15 @@ pub async fn run(
         // process is confirmed dead or the reload grace period elapses — attached
         // daemons are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
+            if let Some(daemon) = pending_respawn.as_mut() {
+                match daemon.has_exited() {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        pending_respawn = None;
+                        needs_intervention = true;
+                    }
+                }
+            }
             let since = *disconnected_at.get_or_insert_with(Instant::now);
             if should_respawn_ephemeral(
                 owned_daemon_pid,
@@ -667,7 +687,10 @@ pub async fn run(
             ) {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
-                    let _ = crate::spawn_ephemeral_daemon(config_dir, socket);
+                    match crate::spawn_owned_ephemeral_daemon(config_dir, socket) {
+                        Ok(daemon) => pending_respawn = Some(daemon),
+                        Err(_) => needs_intervention = true,
+                    }
                 }
             }
 
@@ -686,6 +709,18 @@ pub async fn run(
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
+                        let pending_respawn_pid =
+                            pending_respawn.as_ref().map(crate::SpawnedDaemon::id);
+                        if !reconnect_matches_owned_daemon(
+                            owned_daemon_pid,
+                            pending_respawn_pid,
+                            new_client.server_pid,
+                        ) {
+                            if pending_respawn_pid.is_none() {
+                                needs_intervention = true;
+                            }
+                            continue;
+                        }
                         rpc = Arc::new(new_client);
                         let resume_chat = (
                             chat_pane.current_session_id().map(String::from),
@@ -712,8 +747,9 @@ pub async fn run(
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
                                 disconnected_at = None;
-                                if owned_daemon_pid.is_some() {
-                                    owned_daemon_pid = rpc.server_pid;
+                                if let Some(daemon) = pending_respawn.take() {
+                                    owned_daemon_pid = Some(daemon.id());
+                                    daemon.detach();
                                 }
                                 continue;
                             }
@@ -2468,6 +2504,34 @@ mod tests {
             Duration::from_secs(3600),
             |_| false
         ));
+    }
+
+    #[test]
+    fn owned_reconnect_accepts_only_the_expected_daemon_identity() {
+        assert!(reconnect_matches_owned_daemon(Some(11), None, Some(11)));
+        assert!(!reconnect_matches_owned_daemon(Some(11), None, Some(12)));
+        assert!(!reconnect_matches_owned_daemon(Some(11), None, None));
+    }
+
+    #[test]
+    fn respawned_daemon_identity_takes_precedence_during_readiness() {
+        assert!(reconnect_matches_owned_daemon(Some(11), Some(22), Some(22)));
+        assert!(!reconnect_matches_owned_daemon(
+            Some(11),
+            Some(22),
+            Some(11)
+        ));
+        assert!(!reconnect_matches_owned_daemon(
+            Some(11),
+            Some(22),
+            Some(33)
+        ));
+    }
+
+    #[test]
+    fn attached_reconnect_accepts_any_compatible_daemon() {
+        assert!(reconnect_matches_owned_daemon(None, None, Some(33)));
+        assert!(reconnect_matches_owned_daemon(None, None, None));
     }
 
     #[test]
