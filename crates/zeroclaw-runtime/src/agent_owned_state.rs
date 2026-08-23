@@ -31,8 +31,8 @@ fn resolve_memory_for_owned_state(
     let configured_kind = zeroclaw_memory::classify_memory_backend(&configured_backend);
 
     if let Some(memory) = memory
-        && !(matches!(memory.role(), Role::Memory(MemoryKind::None))
-            && !matches!(configured_kind, zeroclaw_memory::MemoryBackendKind::None))
+        && (!matches!(memory.role(), Role::Memory(MemoryKind::None))
+            || matches!(configured_kind, zeroclaw_memory::MemoryBackendKind::None))
     {
         return Ok(Some(Arc::clone(memory)));
     }
