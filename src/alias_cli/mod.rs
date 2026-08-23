@@ -1006,8 +1006,8 @@ mod tests {
         .await
         .expect_err("a bogus delete must not succeed through the recovery path");
         assert!(
-            err.to_string().contains("not configured"),
-            "expected a `not configured` failure, got: {err}"
+            err.to_string().contains("ghost"),
+            "the localized failure must identify the requested alias, got: {err}"
         );
     }
 }

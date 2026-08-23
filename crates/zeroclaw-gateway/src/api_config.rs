@@ -4505,7 +4505,26 @@ mod tests {
             .unwrap();
         drop(knowledge);
 
-        let state = crate::api::test_state(config.clone());
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory_from_config(&config, None)
+                .expect("open memory backend for deletion retry proof"),
+        );
+        let victim_id = memory.ensure_agent_uuid("victim").await.unwrap();
+        memory
+            .store_with_agent(
+                "victim-memory",
+                "private memory from the retired agent",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&victim_id),
+            )
+            .await
+            .unwrap();
+
+        let mut state = crate::api::test_state(config.clone());
+        state.mem = Arc::clone(&memory);
 
         // ── attempt 1: config commits, knowledge cascade is refused ──────────
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
@@ -4540,6 +4559,11 @@ mod tests {
             "attempt 1 leaves the rows stamped with the deleted alias"
         );
         drop(knowledge);
+        assert_eq!(
+            memory.export_agent("victim").await.unwrap().len(),
+            1,
+            "memory rows must remain when their durable archive cannot be written"
+        );
 
         // ── repair the archive blocker, then retry the SAME delete ──────────
         std::fs::remove_file(agents_dir.join("_deleted")).unwrap();
@@ -4565,6 +4589,118 @@ mod tests {
             knowledge.count_owner("victim").unwrap(),
             0,
             "the retry converges: no rows may stay stamped with the deleted alias"
+        );
+        assert!(
+            memory.export_agent("victim").await.unwrap().is_empty(),
+            "the retry purges memory only after its archive succeeds"
+        );
+    }
+
+    /// Gateway startup may retain a `NoneMemory` placeholder when the configured
+    /// durable backend cannot be opened. Agent deletion must treat that handle as
+    /// unavailable, not as proof that the real store is empty, and converge once
+    /// the backend is reachable again.
+    #[tokio::test]
+    async fn agent_delete_reopens_configured_memory_after_gateway_fallback() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory_from_config(&config, None)
+                .expect("seed configured memory backend"),
+        );
+        let victim_id = memory.ensure_agent_uuid("victim").await.unwrap();
+        memory
+            .store_with_agent(
+                "retired-secret",
+                "must not survive alias reuse",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&victim_id),
+            )
+            .await
+            .unwrap();
+        drop(memory);
+
+        // Preserve the real database while making its configured path
+        // temporarily impossible to open, reproducing the gateway boot
+        // fallback without relying on platform-specific permissions.
+        let memory_dir = config.data_dir.join("memory");
+        let saved_memory_dir = config.data_dir.join("memory.saved");
+        std::fs::rename(&memory_dir, &saved_memory_dir).unwrap();
+        std::fs::write(&memory_dir, b"backend unavailable").unwrap();
+
+        let mut state = crate::api::test_state(config.clone());
+        state.mem = Arc::new(zeroclaw_memory::NoneMemory::new("gateway-fallback"));
+
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let first = delete_agent_cascade(&state, config.clone(), "victim", guard).await;
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let warnings = json
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .expect("unavailable configured memory must be surfaced");
+        assert!(
+            warnings
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|warning| warning.contains("memory backend unavailable")),
+            "the placeholder must not hide the configured backend failure: {warnings:?}"
+        );
+        assert!(
+            !state.config.read().agents.contains_key("victim"),
+            "the first attempt commits the config removal"
+        );
+
+        std::fs::remove_file(&memory_dir).unwrap();
+        std::fs::rename(&saved_memory_dir, &memory_dir).unwrap();
+        let probe = zeroclaw_memory::create_memory_from_config(&config, None)
+            .expect("restore configured memory backend");
+        assert_eq!(
+            probe.export_agent("victim").await.unwrap().len(),
+            1,
+            "the unavailable first attempt must retain the retired agent's memory"
+        );
+        drop(probe);
+
+        let working = state.config.read().clone();
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let second = delete_agent_cascade(&state, working, "victim", guard).await;
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::OK,
+            "the restored backend must let committed-delete recovery converge"
+        );
+
+        let probe = zeroclaw_memory::create_memory_from_config(&config, None)
+            .expect("reopen memory after recovery");
+        assert!(
+            probe.export_agent("victim").await.unwrap().is_empty(),
+            "a recreated alias must not inherit memory from the retired agent"
         );
     }
 

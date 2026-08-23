@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::io::AsyncWriteExt;
+use zeroclaw_api::attribution::{Attributable, MemoryKind, Role};
 use zeroclaw_api::memory_traits::Memory;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
@@ -26,15 +27,23 @@ fn resolve_memory_for_owned_state(
     // An already-open handle may still contain rows after a live config toggle;
     // preserve the pre-existing cleanup behavior instead of stranding those
     // rows when the currently selected backend is `none`.
-    if let Some(memory) = memory {
+    let configured_backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
+    let configured_kind = zeroclaw_memory::classify_memory_backend(&configured_backend);
+
+    if let Some(memory) = memory
+        && !(matches!(memory.role(), Role::Memory(MemoryKind::None))
+            && !matches!(configured_kind, zeroclaw_memory::MemoryBackendKind::None))
+    {
         return Ok(Some(Arc::clone(memory)));
     }
 
-    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
-    if matches!(
-        zeroclaw_memory::classify_memory_backend(&backend),
-        zeroclaw_memory::MemoryBackendKind::None
-    ) {
+    // The gateway deliberately falls back to `NoneMemory` when its configured
+    // durable backend cannot be opened. That placeholder keeps unrelated HTTP
+    // surfaces alive, but it is not evidence that owned memory is empty. When
+    // config still expects persistence, ignore the placeholder and reopen the
+    // canonical configured backend so deletion either cleans it or fails toward
+    // a later retry.
+    if matches!(configured_kind, zeroclaw_memory::MemoryBackendKind::None) {
         return Ok(None);
     }
 
@@ -309,25 +318,27 @@ pub async fn cascade_owned_state(
     // not masked as 0 (markdown/none have no DB rows — their memory lives in the
     // archived workspace — but a real backend error must stay visible). ────────
     let memory_purged = if let Some(mem) = resolved_memory.as_ref() {
-        let mem_rows = match mem.export_agent(alias).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                warnings.push(format!("memory export: {e}"));
-                Vec::new()
-            }
-        };
-        match serde_json::to_vec_pretty(&mem_rows).context("serialize memory export") {
-            Ok(bytes) => {
-                if let Err(err) = write_json(&cascade_dir.join("memory.json"), bytes).await {
+        match mem
+            .export_agent(alias)
+            .await
+            .context("export owned memory")
+            .and_then(|rows| serde_json::to_vec_pretty(&rows).context("serialize memory export"))
+        {
+            Ok(bytes) => match write_json(&cascade_dir.join("memory.json"), bytes).await {
+                Ok(()) => match mem.purge_agent(alias).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warnings.push(format!("memory purge: {e}"));
+                        0
+                    }
+                },
+                Err(err) => {
                     warnings.push(archive_warning("memory", &err));
+                    0
                 }
-            }
-            Err(err) => warnings.push(archive_warning("memory", &err)),
-        }
-        match mem.purge_agent(alias).await {
-            Ok(n) => n,
-            Err(e) => {
-                warnings.push(format!("memory purge: {e}"));
+            },
+            Err(err) => {
+                warnings.push(archive_warning("memory", &err));
                 0
             }
         }
