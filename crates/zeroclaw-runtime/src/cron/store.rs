@@ -5,12 +5,16 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+// Keep lock acquisition bounded below the scheduler's persistence deadline.
+// Immediate write transactions then serialize benign concurrent completions
+// instead of failing while upgrading a deferred read transaction.
+const CRON_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
@@ -828,9 +832,9 @@ pub(crate) fn current_claim_for_test(config: &Config, job_id: &str) -> Result<Cr
             |row| row.get::<_, Option<String>>(0),
         )?
         .map(CronClaimToken)
-        .ok_or_else(|| anyhow::anyhow!("cron job '{job_id}' is not claimed"))
+        .ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
     })?;
-    claim.ok_or_else(|| anyhow::anyhow!("cron job '{job_id}' is not claimed"))
+    claim.ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
 }
 
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
@@ -860,7 +864,7 @@ pub fn record_run(
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
         // cannot grow unboundedly.
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         insert_run_and_prune(
             &tx,
@@ -892,7 +896,7 @@ pub(crate) fn persist_manual_run_result(
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         insert_run_and_prune(
             &tx,
@@ -935,7 +939,7 @@ pub(crate) fn persist_run_result(
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         ensure_claim_is_current(&tx, &job.id, claim)?;
 
@@ -977,7 +981,7 @@ pub(crate) fn persist_run_completion_state(
     claim: &CronClaimToken,
 ) -> Result<()> {
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
         ensure_claim_is_current(&tx, &job.id, claim)?;
         apply_run_completion_state(&tx, job, job_state_at, status, output, action)?;
         release_claim_in_transaction(&tx, &job.id, action, claim)?;
@@ -998,6 +1002,10 @@ fn ensure_claim_is_current(conn: &Connection, job_id: &str, claim: &CronClaimTok
         anyhow::bail!("cron claim for job '{job_id}' is stale");
     }
     Ok(())
+}
+
+fn immediate_write_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
 }
 
 fn release_claim_in_transaction(
@@ -1671,6 +1679,8 @@ fn with_existing_initialized_connection<T>(
             db_path.display().to_string()
         )
     })?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
 
     initialize_schema(&conn)?;
 
@@ -1703,6 +1713,8 @@ fn with_initialized_connection<T>(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
 
     initialize_schema(&conn)?;
 

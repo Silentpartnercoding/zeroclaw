@@ -2777,10 +2777,10 @@ mod sop_step_reassembly_tests {
     }
 
     /// A cross-agent SOP step rebuilds its tool registry. The rebuilt delegate
-    /// tool must retain the outer run's cancellation token or background work
-    /// started by the step can outlive a timed-out cron claim.
+    /// tool must retain the outer cron scope so background delegation remains
+    /// fail-closed after reassembly.
     #[tokio::test]
-    async fn reassembly_threads_owning_run_cancellation_into_delegate_tool() {
+    async fn reassembly_preserves_cron_scope_for_background_delegation_rejection() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
         use zeroclaw_config::schema::{
@@ -2866,43 +2866,24 @@ mod sop_step_reassembly_tests {
             .find(|tool| tool.name() == "delegate")
             .expect("step registry includes delegate");
 
-        cancellation.cancel();
-        let started = delegate
+        let rejected = delegate
             .execute(serde_json::json!({
                 "agent": "target",
                 "prompt": "must not outlive the owning run",
                 "background": true
             }))
             .await
-            .expect("background delegate starts");
-        assert!(started.success, "delegate did not start: {started:?}");
-        let task_id = started
-            .output
-            .into_string()
-            .lines()
-            .find_map(|line| line.strip_prefix("task_id: "))
-            .expect("delegate output includes task id")
-            .to_string();
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let checked = delegate
-                    .execute(serde_json::json!({
-                        "action": "check_result",
-                        "task_id": task_id
-                    }))
-                    .await
-                    .expect("delegate result check succeeds");
-                let output = checked.output.into_string();
-                if output.contains("\"status\": \"cancelled\"") {
-                    break output;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("reassembled delegate observes outer cancellation");
-        assert!(result.contains("Cancelled by parent session"), "{result}");
+            .expect("background rejection returns a tool result");
+        assert!(
+            !rejected.success,
+            "background delegation unexpectedly started"
+        );
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some(
+                "Background delegation is unavailable for supervised cron runs; use synchronous or parallel delegation instead."
+            )
+        );
     }
 
     /// A parent approval manager with a live back-channel survives delegation:

@@ -1757,7 +1757,7 @@ async fn persist_job_result(
     let now = Utc::now();
     let claim = crate::cron::store::current_claim_for_test(config, &job.id).or_else(|_| {
         claim_job_with_lease(config, &job.id, now, now + ChronoDuration::hours(24))?
-            .ok_or_else(|| anyhow::anyhow!("test job '{}' is already claimed", job.id))
+            .ok_or_else(|| anyhow::Error::msg(format!("test job '{}' is already claimed", job.id)))
     });
     let claim = claim.expect("test persistence requires a claimable stored job");
     persist_claimed_job_result(
@@ -3963,9 +3963,12 @@ mod tests {
              ({elapsed:?}); the deadline must hold when all workers are occupied"
         );
         for job in &jobs {
+            let retained_claim = crate::cron::store::current_claim_for_test(&config, &job.id);
             assert!(
                 cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
-                "every job lock must be released when all workers are occupied"
+                "every job lock must be released when all workers are occupied; \
+                 job={} retained_claim={retained_claim:?}",
+                job.id
             );
         }
     }
