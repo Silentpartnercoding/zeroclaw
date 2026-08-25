@@ -568,6 +568,7 @@ mod tests {
         let interrupted = StreamInterruptedAfterOutput {
             partial_text: "partial reply".to_string(),
             message: "model_provider stream error: maximum context length exceeded".to_string(),
+            usage: None,
         };
         let e = anyhow::Error::new(interrupted);
 
