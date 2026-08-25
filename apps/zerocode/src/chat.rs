@@ -12792,7 +12792,11 @@ mod tests {
     fn load_history_strips_enrichment_prefix_from_first_message() {
         use crate::client::MessageEntry;
         let mut s = state();
-        s.reset_for_session("sess-resume".to_string(), None);
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.load_history(
             vec![MessageEntry {
                 role: "user".to_string(),
@@ -12815,7 +12819,11 @@ mod tests {
     fn load_history_skips_prefix_only_content_when_seeding_first_message() {
         use crate::client::MessageEntry;
         let mut s = state();
-        s.reset_for_session("sess-resume".to_string(), None);
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
         s.load_history(
             vec![MessageEntry {
                 role: "user".to_string(),
