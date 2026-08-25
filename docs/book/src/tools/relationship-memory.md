@@ -46,16 +46,25 @@ enabled = true
 legacy_owner_agent = "agent_a"
 ```
 
-The assignment is transactional and idempotent. After it succeeds, the rows obey
-the same directional `read_knowledge_from` rules as newly captured knowledge.
-Agent rename and delete operations rewrite or archive and purge this durable
-ownership through the standard owned-state cascade.
+The assignment is transactional and idempotent. When rows are assigned, the
+runtime logs a warning with the selected alias and row count. After a successful
+multi-agent migration, remove `knowledge.legacy_owner_agent`; leaving it set
+means any future unowned row introduced by an older restore, import, or rollback
+is assigned to that alias on the next startup. Assigned rows obey the same
+directional `read_knowledge_from` rules as newly captured knowledge.
+
+Agent rename moves knowledge ownership, while delete archives and purges it.
+Initial rename works through the supported gateway or CLI lifecycle surfaces,
+but only the gateway currently has a committed-rename retry path, and that path
+uses a gateway-local residue probe rather than the shared delete resolver.
 
 The migrated edge schema retains the old three-column uniqueness rule for
 owner-less inserts, so temporarily rolling back to a pre-attribution binary does
 not make repeated `INSERT OR IGNORE` operations duplicate legacy edges. Rows
 written by that old binary are unowned and fail closed again when a scoped binary
-restarts.
+restarts unless an owner can be resolved. In particular, a still-configured
+`legacy_owner_agent` assigns those rows to that alias and emits the warning
+described above.
 
 ## Concepts
 

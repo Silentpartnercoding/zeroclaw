@@ -1557,7 +1557,22 @@ pub fn all_tools_with_runtime(
                     .map(|owner| owner.as_str())
                     .or_else(|| (enabled_agents.len() == 1).then(|| enabled_agents[0]));
                 match graph.prepare_legacy_ownership(legacy_owner) {
-                    Ok(_) => {
+                    Ok(assigned_rows) => {
+                        if assigned_rows > 0 {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "owner_agent": legacy_owner,
+                                    "assigned_rows": assigned_rows,
+                                })),
+                                "knowledge graph assigned unattributed legacy rows"
+                            );
+                        }
                         // The scope is bound from the trusted registration alias,
                         // never from tool arguments. Reads widen only through the
                         // validated workspace.read_knowledge_from allowlist.
@@ -3578,7 +3593,31 @@ const = true
                 .expect("knowledge tool must register when knowledge.enabled")
         };
 
-        let agent_a_tool = knowledge_tool_for("agent_a");
+        let agent_a_tool = {
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut rx = zeroclaw_log::subscribe_or_install();
+            while rx.try_recv().is_ok() {}
+
+            let tool = knowledge_tool_for("agent_a");
+            let event = std::iter::from_fn(|| rx.try_recv().ok())
+                .find(|event| {
+                    event.get("message").and_then(serde_json::Value::as_str)
+                        == Some("knowledge graph assigned unattributed legacy rows")
+                })
+                .expect("legacy ownership assignment must emit a warning");
+            assert_eq!(
+                event
+                    .get("severity_text")
+                    .and_then(serde_json::Value::as_str),
+                Some("WARN")
+            );
+            assert_eq!(event["attributes"]["owner_agent"], "agent_a");
+            assert_eq!(event["attributes"]["assigned_rows"], 1);
+            zeroclaw_log::clear_broadcast_hook();
+            tool
+        };
         let agent_b_tool = knowledge_tool_for("agent_b");
         let agent_c_tool = knowledge_tool_for("agent_c");
 
