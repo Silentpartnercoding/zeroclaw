@@ -1955,10 +1955,12 @@ mod tests {
             .set_session_agent_alias(&session_key, "rowan")
             .unwrap();
 
-        let mut hygiene = zeroclaw_config::schema::MemoryConfig::default();
-        hygiene.hygiene_enabled = true;
-        hygiene.archive_after_days = 7;
-        hygiene.purge_after_days = 0;
+        let hygiene = zeroclaw_config::schema::MemoryConfig {
+            hygiene_enabled: true,
+            archive_after_days: 7,
+            purge_after_days: 0,
+            ..Default::default()
+        };
         zeroclaw_memory::hygiene::run_if_due(&hygiene, tmp.path()).unwrap();
 
         assert!(backend.list_sessions().is_empty());
