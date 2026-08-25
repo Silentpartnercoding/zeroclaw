@@ -5,8 +5,13 @@ mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+#[cfg(feature = "agent-runtime")]
+mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+mod desktop_cli_linux;
+mod direct_cli_terminal_completion;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
