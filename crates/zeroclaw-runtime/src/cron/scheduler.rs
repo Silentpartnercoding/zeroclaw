@@ -1,15 +1,15 @@
 use crate::cron::store::{
-    RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
+    CronClaimToken, RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
     persist_run_result,
 };
 use crate::cron::{
-    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
-    clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
-    sync_declarative_jobs,
+    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
+    claim_job_with_lease, clear_expired_claims, clear_stale_locks, due_jobs, next_run_for_schedule,
+    release_claim, skip_missed_run, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -42,6 +42,11 @@ const ISOLATED_SESSION_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
 // reliably reach this path. Generous enough for a slow-but-live channel;
 // terminal classification waits until the supervised delivery has stopped.
 const CRON_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+// SQLite persistence is synchronous. Drive it on a blocking worker and bound
+// how long the scheduler awaits that worker; claim-token fencing makes a late
+// worker harmless after its lease is reclaimed.
+const CRON_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
+const CRON_CLAIM_GRACE_SECS: u64 = 60;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -58,6 +63,16 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 #[cfg(test)]
 tokio::task_local! {
     static TEST_DELIVERY_TIMEOUT: Duration;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PERSIST_TIMEOUT: Duration;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PERSIST_BLOCK: Duration;
 }
 
 // Test-only seam: simulates the synchronous, pre-await work that a real
@@ -721,6 +736,23 @@ pub async fn run(
                 // Keep scheduler liveness fresh even when there are no due jobs.
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
+                match clear_expired_claims(&config, Utc::now()) {
+                    Ok(0) => {}
+                    Ok(cleared) => ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"cleared": cleared})),
+                        "Recovered expired cron execution claims"
+                    ),
+                    Err(e) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Failed to recover expired cron execution claims"
+                    ),
+                }
+
                 let jobs = match due_jobs(&config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
@@ -737,7 +769,7 @@ pub async fn run(
                 };
 
                 let jobs = claim_due_jobs(&config, jobs);
-                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                process_claimed_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
             _ = cancel.cancelled() => {
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
@@ -800,7 +832,7 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 
     let jobs = claim_due_jobs(config, jobs);
-    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    process_claimed_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -1009,38 +1041,76 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
+struct ClaimedJob {
+    job: CronJob,
+    claim: CronClaimToken,
+}
+
+fn cron_claim_deadline(config: &Config, job: &CronJob, now: DateTime<Utc>) -> DateTime<Utc> {
+    let owning_agent = resolve_owning_agent(config, job).unwrap_or_default();
+    let attempt_secs = match job.job_type {
+        JobType::Shell => SHELL_JOB_TIMEOUT_SECS,
+        JobType::Agent => resolve_agent_job_timeout(config, owning_agent).as_secs(),
+    };
+    let attempts = u64::from(config.reliability.scheduler_retries).saturating_add(1);
+
+    let mut retry_delay_ms = config.reliability.provider_backoff_ms.max(200);
+    let mut total_backoff_ms = 0_u64;
+    for _ in 0..config.reliability.scheduler_retries {
+        total_backoff_ms = total_backoff_ms
+            .saturating_add(retry_delay_ms)
+            .saturating_add(250);
+        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(30_000);
+    }
+
+    let lease_secs = attempt_secs
+        .saturating_mul(attempts)
+        .saturating_add(total_backoff_ms.saturating_add(999) / 1_000)
+        .saturating_add(CRON_DELIVERY_TIMEOUT.as_secs())
+        .saturating_add(CRON_PERSIST_TIMEOUT.as_secs())
+        .saturating_add(CRON_CLAIM_GRACE_SECS)
+        .max(CRON_CLAIM_GRACE_SECS);
+    let lease_secs = i64::try_from(lease_secs).unwrap_or(i64::MAX);
+    now.checked_add_signed(ChronoDuration::seconds(lease_secs))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<ClaimedJob> {
     jobs.into_iter()
-        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
-            Ok(true) => true,
-            Ok(false) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"job_id": job.id})),
-                    "Cron job already in flight; skipping duplicate launch"
-                );
-                false
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
-                        ),
-                    "Cron job: failed to claim in-flight lock; skipping launch"
-                );
-                false
+        .filter_map(|job| {
+            let now = Utc::now();
+            match claim_job_with_lease(config, &job.id, now, cron_claim_deadline(config, &job, now))
+            {
+                Ok(Some(claim)) => Some(ClaimedJob { job, claim }),
+                Ok(None) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                        "Cron job already in flight; skipping duplicate launch"
+                    );
+                    None
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                            ),
+                        "Cron job: failed to claim in-flight lock; skipping launch"
+                    );
+                    None
+                }
             }
         })
         .collect()
 }
 
-async fn process_due_jobs(
+async fn process_claimed_jobs(
     config: &Config,
-    jobs: Vec<CronJob>,
+    jobs: Vec<ClaimedJob>,
     component: &str,
     event_tx: &EventBroadcast,
 ) {
@@ -1048,10 +1118,11 @@ async fn process_due_jobs(
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
+    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|claimed| {
+        let ClaimedJob { job, claim } = claimed;
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
-            let _ = release_job(config, &job.id);
+            let _ = release_claim(config, &job.id, &claim);
             return None;
         };
         let agent_alias = agent_alias.to_owned();
@@ -1059,18 +1130,19 @@ async fn process_due_jobs(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
-                let _ = release_job(config, &job.id);
+                let _ = release_claim(config, &job.id, &claim);
                 return None;
             }
         };
         let config = config.clone();
         let component = component.to_owned();
         Some(async move {
-            Box::pin(execute_and_persist_job(
+            Box::pin(execute_and_persist_claimed_job(
                 &config,
                 security.as_ref(),
                 &agent_alias,
                 &job,
+                &claim,
                 &component,
             ))
             .await
@@ -1101,11 +1173,30 @@ async fn process_due_jobs(
     }
 }
 
-async fn execute_and_persist_job(
+#[cfg(test)]
+async fn process_due_jobs(
+    config: &Config,
+    jobs: Vec<CronJob>,
+    component: &str,
+    event_tx: &EventBroadcast,
+) {
+    let claimed = jobs
+        .into_iter()
+        .map(|job| {
+            let claim = crate::cron::store::current_claim_for_test(config, &job.id)
+                .unwrap_or_else(|_| CronClaimToken::synthetic_for_test());
+            ClaimedJob { job, claim }
+        })
+        .collect();
+    process_claimed_jobs(config, claimed, component, event_tx).await;
+}
+
+async fn execute_and_persist_claimed_job(
     config: &Config,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    claim: &CronClaimToken,
     component: &str,
 ) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
@@ -1124,31 +1215,31 @@ async fn execute_and_persist_job(
     .instrument(span)
     .await;
     let finished_at = Utc::now();
-    let success = Box::pin(persist_job_result(
+    let success = Box::pin(persist_claimed_job_result(
         config,
         job,
         success,
         &output,
         started_at,
         finished_at,
+        claim,
     ))
     .await;
 
-    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
-    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
-    // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup
-    if let Err(e) = release_job(config, &job.id) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "Cron job: failed to release in-flight lock after run"
-        );
-    }
-
     (job.id.clone(), success, output)
+}
+
+#[cfg(test)]
+async fn execute_and_persist_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    job: &CronJob,
+    component: &str,
+) -> (String, bool, String) {
+    let claim = crate::cron::store::current_claim_for_test(config, &job.id)
+        .expect("test job must be claimed before execution");
+    execute_and_persist_claimed_job(config, security, agent_alias, job, &claim, component).await
 }
 
 /// Resolve the wall-clock deadline for an agent cron job's `agent::run`
@@ -1516,13 +1607,14 @@ async fn run_agent_job_with_timeout(
     }
 }
 
-async fn persist_job_result(
+async fn persist_claimed_job_result(
     config: &Config,
     job: &CronJob,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
+    claim: &CronClaimToken,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(
@@ -1534,7 +1626,8 @@ async fn persist_job_result(
     )
     .await;
 
-    let action = if is_one_shot_auto_delete(job) && outcome.success {
+    let reported_success = outcome.success;
+    let action = if is_one_shot_auto_delete(job) && reported_success {
         RunCompletionAction::Delete
     } else if matches!(job.schedule, Schedule::At { .. }) {
         RunCompletionAction::Disable
@@ -1542,70 +1635,141 @@ async fn persist_job_result(
         RunCompletionAction::Reschedule
     };
 
+    let owned_config = config.clone();
+    let owned_job = job.clone();
+    let owned_claim = claim.clone();
+    let status = outcome.status;
+    let persisted_output = outcome.output;
     let job_state_at = Utc::now();
-    if let Err(e) = persist_run_result(
-        config,
-        job,
-        started_at,
-        finished_at,
-        job_state_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-        action,
-    ) {
-        ::zeroclaw_log::record!(
+    #[cfg(test)]
+    let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
+    let worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(duration) = persist_block {
+            std::thread::sleep(duration);
+        }
+
+        if let Err(e) = persist_run_result(
+            &owned_config,
+            &owned_job,
+            started_at,
+            finished_at,
+            job_state_at,
+            &status,
+            Some(&persisted_output),
+            duration_ms,
+            action,
+            &owned_claim,
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "Failed to persist scheduler run result: "
+            );
+
+            if action == RunCompletionAction::Delete {
+                // Best-effort fallback for the legacy behavior: a successful
+                // auto-delete one-shot should not be picked up again if the
+                // combined history+state transaction fails while inserting or
+                // pruning the run row.
+                if let Err(disable_err) = persist_run_completion_state(
+                    &owned_config,
+                    &owned_job,
+                    job_state_at,
+                    &status,
+                    Some(&persisted_output),
+                    RunCompletionAction::Disable,
+                    &owned_claim,
+                ) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"disable_err": disable_err.to_string()})
+                            ),
+                        "Failed to disable one-shot cron job after history persistence failure: "
+                    );
+                }
+            } else {
+                // For recurring jobs and non-delete one-shots, keep the scheduler
+                // moving even if run-history persistence fails.
+                if let Err(state_err) = persist_run_completion_state(
+                    &owned_config,
+                    &owned_job,
+                    job_state_at,
+                    &status,
+                    Some(&persisted_output),
+                    action,
+                    &owned_claim,
+                ) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
+                        "Failed to update cron job state after history persistence failure: "
+                    );
+                }
+            }
+        }
+    });
+
+    #[cfg(test)]
+    let persist_timeout = TEST_PERSIST_TIMEOUT
+        .try_with(|duration| *duration)
+        .unwrap_or(CRON_PERSIST_TIMEOUT);
+    #[cfg(not(test))]
+    let persist_timeout = CRON_PERSIST_TIMEOUT;
+
+    match time::timeout(persist_timeout, worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_error)) => ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"e": e.to_string()})),
-            "Failed to persist scheduler run result: "
-        );
-
-        if action == RunCompletionAction::Delete {
-            // Best-effort fallback for the legacy behavior: a successful
-            // auto-delete one-shot should not be picked up again if the
-            // combined history+state transaction fails while inserting or
-            // pruning the run row.
-            if let Err(disable_err) = persist_run_completion_state(
-                config,
-                job,
-                job_state_at,
-                &outcome.status,
-                Some(&outcome.output),
-                RunCompletionAction::Disable,
-            ) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"disable_err": disable_err.to_string()})),
-                    "Failed to disable one-shot cron job after history persistence failure: "
-                );
-            }
-        } else {
-            // For recurring jobs and non-delete one-shots, keep the scheduler
-            // moving even if run-history persistence fails.
-            if let Err(state_err) = persist_run_completion_state(
-                config,
-                job,
-                job_state_at,
-                &outcome.status,
-                Some(&outcome.output),
-                action,
-            ) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
-                    "Failed to update cron job state after history persistence failure: "
-                );
-            }
-        }
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": join_error.to_string()})),
+            "Cron persistence worker stopped before completion"
+        ),
+        Err(_) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
+            "Cron persistence exceeded its deadline; retaining the fenced claim for recovery"
+        ),
     }
 
-    outcome.success
+    reported_success
+}
+
+#[cfg(test)]
+async fn persist_job_result(
+    config: &Config,
+    job: &CronJob,
+    success: bool,
+    output: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+) -> bool {
+    let now = Utc::now();
+    let claim = crate::cron::store::current_claim_for_test(config, &job.id).or_else(|_| {
+        claim_job_with_lease(config, &job.id, now, now + ChronoDuration::hours(24))?
+            .ok_or_else(|| anyhow::anyhow!("test job '{}' is already claimed", job.id))
+    });
+    let claim = claim.expect("test persistence requires a claimable stored job");
+    persist_claimed_job_result(
+        config,
+        job,
+        success,
+        output,
+        started_at,
+        finished_at,
+        &claim,
+    )
+    .await
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -4342,6 +4506,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_persistence_is_bounded_and_cannot_overwrite_reclaimed_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let old_claim = claim_job_with_lease(
+            &config,
+            &job.id,
+            started,
+            started + ChronoDuration::seconds(1),
+        )
+        .unwrap()
+        .expect("old worker claims the job");
+
+        let wall_started = std::time::Instant::now();
+        let success = TEST_PERSIST_TIMEOUT
+            .scope(
+                Duration::from_millis(25),
+                TEST_PERSIST_BLOCK.scope(
+                    Duration::from_millis(200),
+                    persist_claimed_job_result(
+                        &config,
+                        &job,
+                        true,
+                        "late old result",
+                        started,
+                        started + ChronoDuration::milliseconds(10),
+                        &old_claim,
+                    ),
+                ),
+            )
+            .await;
+        assert!(success);
+        assert!(
+            wall_started.elapsed() < Duration::from_millis(150),
+            "scheduler must stop awaiting a blocked persistence worker"
+        );
+
+        assert_eq!(
+            clear_expired_claims(&config, started + ChronoDuration::seconds(2)).unwrap(),
+            1
+        );
+        let replacement = claim_job_with_lease(
+            &config,
+            &job.id,
+            started + ChronoDuration::seconds(2),
+            started + ChronoDuration::hours(1),
+        )
+        .unwrap()
+        .expect("replacement worker reclaims the expired lease");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            cron::list_runs(&config, &job.id, 10).unwrap().is_empty(),
+            "the detached old worker must be fenced before writing run history"
+        );
+        assert_eq!(
+            crate::cron::store::current_claim_for_test(&config, &job.id).unwrap(),
+            replacement
+        );
+        assert!(release_claim(&config, &job.id, &replacement).unwrap());
+    }
+
+    #[tokio::test]
     async fn persist_job_result_uses_one_write_connection_for_recurring_job() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -4355,7 +4583,8 @@ mod tests {
         assert!(success);
         assert_eq!(
             crate::cron::store::write_connection_count_for_tests(&config),
-            1
+            2,
+            "one connection claims the job and one atomically persists and releases it"
         );
     }
 
@@ -4395,6 +4624,8 @@ mod tests {
         let original_next_run = job.next_run;
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
+
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
 
         let conn =
             rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db")).unwrap();
@@ -4505,7 +4736,8 @@ mod tests {
         assert!(!success);
         assert_eq!(
             crate::cron::store::write_connection_count_for_tests(&config),
-            1
+            2,
+            "one connection claims the job and one atomically persists and releases it"
         );
     }
 

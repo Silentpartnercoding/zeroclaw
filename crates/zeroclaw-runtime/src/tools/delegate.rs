@@ -135,8 +135,10 @@ pub struct DelegateTool {
     delegate_config: DelegateToolConfig,
     /// Workspace directory inherited from the root agent context.
     workspace_dir: PathBuf,
-    /// Cancellation token for cascade control of background tasks.
-    cancellation_token: CancellationToken,
+    /// Cancellation scope for delegated work. The ownership bit is kept with
+    /// the canonical token so nested registries cannot mistake an ordinary
+    /// delegate child token for a cron-owned run deadline.
+    cancellation: DelegationCancellation,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
     /// nested model provider map for brain resolution.
@@ -165,6 +167,38 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+}
+
+#[derive(Clone)]
+enum DelegationCancellation {
+    Local(CancellationToken),
+    RunOwned(CancellationToken),
+}
+
+impl DelegationCancellation {
+    fn token(&self) -> &CancellationToken {
+        match self {
+            Self::Local(token) | Self::RunOwned(token) => token,
+        }
+    }
+
+    fn child(&self) -> Self {
+        match self {
+            Self::Local(token) => Self::Local(token.child_token()),
+            Self::RunOwned(token) => Self::RunOwned(token.child_token()),
+        }
+    }
+
+    fn run_owned_token(&self) -> Option<CancellationToken> {
+        match self {
+            Self::Local(_) => None,
+            Self::RunOwned(token) => Some(token.clone()),
+        }
+    }
+
+    fn is_run_owned(&self) -> bool {
+        matches!(self, Self::RunOwned(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +303,7 @@ impl DelegateTool {
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
-            cancellation_token: CancellationToken::new(),
+            cancellation: DelegationCancellation::Local(CancellationToken::new()),
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -317,7 +351,7 @@ impl DelegateTool {
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
-            cancellation_token: CancellationToken::new(),
+            cancellation: DelegationCancellation::Local(CancellationToken::new()),
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -378,13 +412,13 @@ impl DelegateTool {
     /// Attach a cancellation token for cascade control of background tasks.
     /// When the token is cancelled, all background sub-agents are aborted.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.cancellation_token = token;
+        self.cancellation = DelegationCancellation::RunOwned(token);
         self
     }
 
     /// Return the cancellation token for external cascade control.
     pub fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
+        self.cancellation.token()
     }
 
     /// Attach memory for namespace isolation on delegate agents.
@@ -790,7 +824,7 @@ impl DelegateTool {
             // lifetime. `None` only when the parent registry itself had no live
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
-            Some(self.cancellation_token.clone()),
+            self.cancellation.run_owned_token(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1208,6 +1242,16 @@ impl Tool for DelegateTool {
             .get("background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        if background && self.cancellation.is_run_owned() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "delegate-background-cron-owned-rejected",
+                )),
+            });
+        }
 
         if background {
             return self.execute_background(agent_name, prompt, &args).await;
@@ -1636,7 +1680,8 @@ impl DelegateTool {
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
-        let child_token = self.cancellation_token.child_token();
+        let child_cancellation = self.cancellation.child();
+        let child_token = child_cancellation.token().clone();
         // Register the live token so `cancel_task` can actually abort THIS task (removed
         // when it settles, in the spawned closure below).
         Self::background_task_cancels()
@@ -1669,7 +1714,7 @@ impl DelegateTool {
                     multimodal_config,
                     delegate_config,
                     workspace_dir: workspace_dir.clone(),
-                    cancellation_token: child_token.clone(),
+                    cancellation: child_cancellation,
                     memory,
                     providers_models,
                     risk_profiles,
@@ -1904,7 +1949,7 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
-            let cancellation_token = self.cancellation_token.child_token();
+            let cancellation = self.cancellation.child();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -1935,7 +1980,7 @@ impl DelegateTool {
                         multimodal_config,
                         delegate_config,
                         workspace_dir,
-                        cancellation_token,
+                        cancellation,
                         memory,
                         providers_models,
                         risk_profiles,
@@ -2419,7 +2464,7 @@ impl DelegateTool {
     /// Cancel all background tasks (cascade control).
     /// Call this when the parent session ends.
     pub fn cancel_all_background_tasks(&self) {
-        self.cancellation_token.cancel();
+        self.cancellation.token().cancel();
     }
 
     fn compose_independent_system_prompt(
@@ -2826,7 +2871,7 @@ impl DelegateTool {
                 history: &mut history,
                 channel_name: "delegate",
                 channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
+                cancellation_token: Some(self.cancellation.token().child_token()),
                 on_delta: None,
                 shared_budget: None,
                 // TODO thread from parent in future
@@ -4033,7 +4078,6 @@ mod tests {
         _tmp: TempDir,
         tool: Arc<dyn Tool>,
         cancellation: CancellationToken,
-        workspace_dir: PathBuf,
     }
 
     fn factory_cancellation_fixture(model_uri: String) -> FactoryCancellationFixture {
@@ -4145,15 +4189,14 @@ mod tests {
             _tmp: tmp,
             tool,
             cancellation,
-            workspace_dir,
         }
     }
 
     #[tokio::test]
-    async fn factory_run_cancellation_stops_background_delegate() {
+    async fn factory_run_cancellation_rejects_background_delegate_before_spawn() {
         let (_server, requests) = start_hanging_chat_server().await;
         let fixture = factory_cancellation_fixture(_server.uri.clone());
-        let start = fixture
+        let result = fixture
             .tool
             .execute(json!({
                 "agent": "target",
@@ -4161,30 +4204,43 @@ mod tests {
                 "background": true
             }))
             .await
-            .expect("background delegation starts");
+            .expect("background delegation returns a tool result");
         assert!(
-            start.success,
-            "background delegation failed to start: {start:?}"
+            !result.success,
+            "cron-owned background delegation must fail closed: {result:?}"
         );
-        let task_id = start
-            .output
-            .lines()
-            .find(|line| line.starts_with("task_id:"))
-            .expect("background task id")
-            .trim_start_matches("task_id: ")
-            .trim();
-
-        wait_for_request_count(&requests, 1).await;
-        fixture.cancellation.cancel();
-        let result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
-        assert_eq!(result.status, BackgroundTaskStatus::Cancelled, "{result:?}");
-
-        let settled_requests = requests.load(std::sync::atomic::Ordering::SeqCst);
-        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
-            settled_requests,
-            "a cancelled background delegate must not resume provider work"
+            0,
+            "rejected background delegation must not reach the provider"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Background delegation is unavailable for supervised cron runs; use synchronous or parallel delegation instead."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_run_cancellation_allows_synchronous_delegate_to_complete() {
+        let server = start_final_chat_server(vec!["synchronous cron delegate completed"]).await;
+        let fixture = factory_cancellation_fixture(server.uri.clone());
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "complete inside the supervised run"
+            }))
+            .await
+            .expect("synchronous delegation returns a tool result");
+
+        assert!(result.success, "synchronous delegation failed: {result:?}");
+        assert!(
+            result
+                .output
+                .contains("synchronous cron delegate completed"),
+            "unexpected delegate output: {result:?}"
         );
     }
 
