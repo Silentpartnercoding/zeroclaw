@@ -9514,21 +9514,22 @@ mod tests {
 
         let mut master_fd = -1;
         let mut slave_fd = -1;
-        let mut initial_size = libc::winsize {
+        let initial_size = libc::winsize {
             ws_row: 20,
             ws_col: 80,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let initial_size_ptr = std::ptr::from_ref(&initial_size).cast_mut();
         // SAFETY: both output pointers are valid for writes, the optional
         // name/termios pointers are null, and `initial_size` is initialized.
         let opened = unsafe {
             libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
+                &raw mut master_fd,
+                &raw mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut initial_size,
+                initial_size_ptr,
             )
         };
         assert_eq!(
