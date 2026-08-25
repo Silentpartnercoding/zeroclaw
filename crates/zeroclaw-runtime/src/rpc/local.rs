@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -18,6 +18,10 @@ use zeroclaw_config::schema::Config;
 use platform::LocalStream;
 
 const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Best-effort deadline for half-closing a local stream after daemon
+/// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -53,8 +57,6 @@ pub fn socket_path(config: &Config) -> PathBuf {
 
 // ── Transport ────────────────────────────────────────────────────
 
-/// Platform-neutral half-write type produced by `tokio::io::split`.
-type LocalWriteHalf = tokio::io::WriteHalf<LocalStream>;
 /// Platform-neutral half-read type produced by `tokio::io::split`.
 type LocalReadHalf = tokio::io::ReadHalf<LocalStream>;
 
@@ -64,35 +66,49 @@ pub struct LocalTransport {
     peer_label: String,
 }
 
+async fn run_writer<W>(
+    mut writer: W,
+    mut writer_rx: mpsc::Receiver<String>,
+    cancel: CancellationToken,
+    shutdown_timeout: Duration,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let mut line = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            line = writer_rx.recv() => match line {
+                Some(line) => line,
+                None => break,
+            },
+        };
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        let written = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            result = writer.write_all(line.as_bytes()) => result.is_ok(),
+        };
+        if !written {
+            break;
+        }
+    }
+    let _ = tokio::time::timeout(shutdown_timeout, writer.shutdown()).await;
+}
+
 impl LocalTransport {
     pub fn new(stream: LocalStream, cancel: CancellationToken) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        zeroclaw_spawn::spawn!(async move {
-            let mut writer: LocalWriteHalf = write_half;
-            // Session approval channels and log forwarders retain writer
-            // senders past disconnect, so channel closure alone cannot end
-            // this task. On cancellation, half-close the stream so the peer
-            // reads EOF instead of hanging on an abandoned daemon iteration.
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    line = writer_rx.recv() => {
-                        let Some(mut line) = line else { break };
-                        if !line.ends_with('\n') {
-                            line.push('\n');
-                        }
-                        if writer.write_all(line.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = writer.shutdown().await;
-        });
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        // Session approval channels and log forwarders retain writer senders
+        // past disconnect, so channel closure alone cannot end this task.
+        // Cancellation interrupts both queue waits and an in-flight write;
+        // shutdown is bounded for suspended local peers.
+        zeroclaw_spawn::spawn!(run_writer(write_half, writer_rx, cancel, SHUTDOWN_TIMEOUT));
 
         Self {
             reader: BufReader::new(read_half),
@@ -1349,6 +1365,56 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_non_reading_peer_write_and_bounds_shutdown() {
+        let (server, mut non_reading_peer) = tokio::io::duplex(1);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            server,
+            writer_rx,
+            writer_cancel,
+            Duration::from_millis(50),
+        ));
+
+        // Preload a frame larger than the duplex capacity. With the peer
+        // reading only the first byte and then stopping, `write_all` cannot
+        // finish.
+        writer_tx.send("x".repeat(64 * 1024)).await.unwrap();
+        let mut first_byte = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            non_reading_peer.read_exact(&mut first_byte),
+        )
+        .await
+        .expect("writer must start the queued frame")
+        .expect("read first queued byte");
+        assert_eq!(first_byte, [b'x']);
+        assert!(
+            !writer_task.is_finished(),
+            "writer must be pending on the non-reading local peer"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(250), writer_task)
+            .await
+            .expect("cancellation and bounded shutdown must release the writer")
+            .expect("writer task must not panic");
+
+        // Keep the sender alive through cancellation: EOF must result from
+        // releasing the stream, not from closing the writer queue.
+        let mut buffered = Vec::new();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            non_reading_peer.read_to_end(&mut buffered),
+        )
+        .await
+        .expect("released local stream must reach EOF")
+        .expect("read buffered prefix");
+        drop(writer_tx);
     }
 
     #[cfg(windows)]

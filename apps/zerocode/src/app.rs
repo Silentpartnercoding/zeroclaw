@@ -401,6 +401,17 @@ pub(crate) fn reconnect_matches_owned_daemon(
         .is_none_or(|expected_pid| server_pid == Some(expected_pid))
 }
 
+fn record_automatic_respawn_failure(
+    owned_daemon_pid: &mut Option<u32>,
+    needs_intervention: &mut bool,
+) {
+    // The original owned process is already dead and the one automatic
+    // replacement has definitively failed. Release the stale identity gate so
+    // a compatible manual restart can be adopted by the polling loop.
+    *owned_daemon_pid = None;
+    *needs_intervention = true;
+}
+
 /// Probe whether the owned daemon process still exists. `kill(pid, 0)`
 /// succeeds (or fails with EPERM) while the process is alive.
 #[cfg(unix)]
@@ -674,7 +685,10 @@ pub async fn run(
                     Ok(false) => {}
                     Ok(true) | Err(_) => {
                         pending_respawn = None;
-                        needs_intervention = true;
+                        record_automatic_respawn_failure(
+                            &mut owned_daemon_pid,
+                            &mut needs_intervention,
+                        );
                     }
                 }
             }
@@ -689,7 +703,10 @@ pub async fn run(
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
                     match crate::spawn_owned_ephemeral_daemon(config_dir, socket) {
                         Ok(daemon) => pending_respawn = Some(daemon),
-                        Err(_) => needs_intervention = true,
+                        Err(_) => record_automatic_respawn_failure(
+                            &mut owned_daemon_pid,
+                            &mut needs_intervention,
+                        ),
                     }
                 }
             }
@@ -2532,6 +2549,31 @@ mod tests {
     fn attached_reconnect_accepts_any_compatible_daemon() {
         assert!(reconnect_matches_owned_daemon(None, None, Some(33)));
         assert!(reconnect_matches_owned_daemon(None, None, None));
+    }
+
+    #[test]
+    fn failed_automatic_replacement_releases_stale_pid_for_manual_recovery() {
+        let mut owned_pid = Some(11);
+        let mut pending_pid = Some(22);
+        let manual_pid = Some(33);
+        let mut needs_intervention = false;
+
+        assert!(
+            !reconnect_matches_owned_daemon(owned_pid, pending_pid, manual_pid),
+            "exact replacement identity must remain enforced while it is active"
+        );
+
+        // The automatic child exits: production drops `pending_respawn`, then
+        // records the definitive failure through this transition.
+        pending_pid = None;
+        record_automatic_respawn_failure(&mut owned_pid, &mut needs_intervention);
+
+        assert!(owned_pid.is_none());
+        assert!(needs_intervention);
+        assert!(
+            reconnect_matches_owned_daemon(owned_pid, pending_pid, manual_pid),
+            "a compatible manual restart must be accepted after replacement failure"
+        );
     }
 
     #[test]
