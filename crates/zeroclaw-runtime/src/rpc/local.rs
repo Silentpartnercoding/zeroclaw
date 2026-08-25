@@ -307,6 +307,8 @@ mod platform {
                 parent.display()
             )
         })?;
+        // SAFETY: `geteuid` is a parameter-free process query with no pointer
+        // arguments or memory ownership requirements.
         let euid = unsafe { libc::geteuid() };
         let mode = metadata.mode();
         if metadata.uid() != euid && metadata.uid() != 0 {
@@ -345,6 +347,8 @@ mod platform {
                 lock_path.display()
             );
         }
+        // SAFETY: `geteuid` is a parameter-free process query with no pointer
+        // arguments or memory ownership requirements.
         let euid = unsafe { libc::geteuid() };
         if metadata.uid() != euid {
             anyhow::bail!(

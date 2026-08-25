@@ -4291,7 +4291,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 return Ok(());
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
-                unreachable!()
+                anyhow::bail!("documentation command was not handled before runtime dispatch")
             }
             _ => {
                 anyhow::bail!(
@@ -4320,7 +4320,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        | Commands::MarkdownSchema => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
+        }
 
         Commands::Quickstart {
             model_provider,
@@ -7456,7 +7458,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             .await
         }
         // List/Validate/Show are dispatched on the local synchronous path.
-        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+        _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
 
