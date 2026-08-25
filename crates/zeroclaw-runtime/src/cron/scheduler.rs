@@ -2985,14 +2985,13 @@ mod tests {
         use tokio::net::TcpListener;
         use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
 
-        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let fail_first_request = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let requests_for_handler = Arc::clone(&requests);
+        let next_shell_marker = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fail_first_for_handler = Arc::clone(&fail_first_request);
+        let next_shell_marker_for_handler = Arc::clone(&next_shell_marker);
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move |Json(body): Json<serde_json::Value>| {
-                requests_for_handler.lock().unwrap().push(body.clone());
                 let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
                     messages.iter().any(|message| {
                         message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
@@ -3010,6 +3009,9 @@ mod tests {
                         }))
                         .into_response();
                     }
+                    let marker_id = next_shell_marker_for_handler
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let shell_command = format!("touch cron-tool-run-{marker_id}.marker");
                     Json(serde_json::json!({
                         "choices": [{
                             "message": {
@@ -3019,7 +3021,7 @@ mod tests {
                                     "type": "function",
                                     "function": {
                                         "name": "shell",
-                                        "arguments": "{\"command\":\"pwd\"}"
+                                        "arguments": serde_json::json!({"command": shell_command}).to_string()
                                     }
                                 }]
                             }
@@ -3054,8 +3056,9 @@ mod tests {
             },
         );
         config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
-        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
-            crate::security::AutonomyLevel::Full;
+        let risk_profile = config.risk_profiles.get_mut(TEST_AGENT).unwrap();
+        risk_profile.level = crate::security::AutonomyLevel::Full;
+        risk_profile.allowed_commands.push("touch".into());
 
         let mut security = test_security(&config);
         let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
@@ -3092,29 +3095,19 @@ mod tests {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
         }
 
-        let requests = requests.lock().unwrap();
-        let tool_results: Vec<&str> = requests
-            .iter()
-            .filter_map(|request| {
-                request["messages"].as_array()?.iter().find_map(|message| {
-                    (message.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
-                        .then(|| message.get("content")?.as_str())
-                        .flatten()
+        let shell_runs = std::fs::read_dir(&expected_workspace)
+            .expect("scheduler workspace entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("cron-tool-run-") && name.ends_with(".marker")
                 })
             })
-            .collect();
+            .count();
         assert_eq!(
-            tool_results.len(),
-            5,
-            "each successful run must execute shell once"
+            shell_runs, 5,
+            "each successful run must execute shell once in the scheduler workspace"
         );
-        for tool_result in tool_results {
-            assert!(
-                tool_result.contains(expected_workspace.to_string_lossy().as_ref()),
-                "shell output must come from the scheduler workspace {:?}, got {tool_result:?}",
-                expected_workspace
-            );
-        }
 
         server.abort();
     }
