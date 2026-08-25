@@ -1112,6 +1112,17 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // Session replacement and prompt execution share one admission
+        // permit. Resolve and install the new incarnation only after the
+        // previous same-ID turn has fully finalized its durable state.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
@@ -1730,6 +1741,17 @@ impl RpcDispatcher {
             ));
         }
 
+        // Admission fences the complete session incarnation: agent, mode,
+        // attachments, durable writes, and terminal state are all resolved
+        // while same-ID replacement is excluded.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
             None => match self.rehydrate_reaped_session(sid).await {
@@ -1786,14 +1808,6 @@ impl RpcDispatcher {
                 prompt.push_str(&result.marker);
             }
         }
-
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let chat_mode = self
             .ctx
@@ -11510,6 +11524,126 @@ mod tests {
             after.turn_id.as_deref(),
             Some("chat-era-turn"),
             "an ACP turn must not stamp its own turn id onto the retained Chat row"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_id_chat_replacement_waits_for_blocked_acp_prompt_finalization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-replaced-by-chat";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let sid_for_prompt = sid.to_string();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_prompt,
+                    "prompt": "blocked ACP turn",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("ACP provider must block after prompt admission");
+
+        let replacement_handle = dispatcher.spawn_handle();
+        let sid_for_replacement = sid.to_string();
+        let replacement_task = zeroclaw_spawn::spawn!(async move {
+            replacement_handle
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid_for_replacement,
+                    "chat_mode": "chat",
+                }))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if sessions.session_queue.queue_depth(sid).await == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-ID replacement must register behind the admitted ACP prompt");
+        assert!(
+            !replacement_task.is_finished(),
+            "session/new must not replace a same-ID session while its prompt owns admission"
+        );
+        assert!(
+            chat_backend
+                .get_session_state(&format!("rpc_{sid}"))
+                .unwrap()
+                .is_none(),
+            "the blocked ACP incarnation must not create Chat durable state"
+        );
+
+        release_tx.send(()).unwrap();
+        let prompt_result = prompt_task.await.expect("prompt task must not panic");
+        assert!(
+            prompt_result.is_ok(),
+            "ACP prompt should finish: {prompt_result:?}"
+        );
+        let replacement_result = replacement_task
+            .await
+            .expect("replacement task must not panic");
+        assert!(
+            replacement_result.is_ok(),
+            "Chat replacement should succeed after ACP finalization: {replacement_result:?}"
+        );
+
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        let key = format!("rpc_{sid}");
+        let replacement_state = chat_backend
+            .get_session_state(&key)
+            .unwrap()
+            .expect("Chat replacement must create its durable row");
+        assert_eq!(replacement_state.state, "idle");
+        assert!(replacement_state.turn_id.is_none());
+        assert!(
+            chat_backend.load(&key).is_empty(),
+            "the finalized ACP prompt must not append into the replacement Chat transcript"
         );
     }
 }
