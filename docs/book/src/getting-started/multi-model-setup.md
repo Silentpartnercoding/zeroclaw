@@ -37,11 +37,15 @@ For transient errors such as a network failure, `503`, or timeout, a non-streami
 
 A streaming call selects the first eligible, non-cooling entry that supports the required stream capabilities. It does not advance to another entry after that stream starts. If the stream fails before visible output reaches an immutable consumer, the runtime retries the whole call through the non-streaming path, which can walk the fallback graph. Once visible output exists, the runtime preserves the partial response and does not replay the request or switch providers. See [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md#streaming-and-replay-boundary) for the complete contract.
 
-## API key rotation limitation
+## API key rotation
 
-Do not rely on `reliability.api_keys` for credential failover. On a retryable rate limit, the reliable wrapper selects and logs an alternate key, but the `ModelProvider` trait cannot apply it to the already constructed provider. The retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks this limitation.
+`reliability.api_keys` supplies additional API keys for the primary provider profile. After a retryable rate limit, ZeroClaw cools the failed key, rebuilds the same provider candidate with the next healthy key, and retries within the configured `provider_retries` bound. Live config replacement and removal are observed before the next credential selection.
 
-Use separate provider profiles with their own credentials, or an external routing service, when credential-level failover is required.
+Rotation is available only when the provider factory confirms that `api_key` is the credential sent on the wire. OAuth refresh-token modes, Anthropic setup tokens, ambient or CLI authentication, `requires_openai_auth`, and providers that ignore `api_key` are excluded. A route-level key stays with that exact route, fallback profiles use their own keys, and neither receives the primary profile's additional-key pool.
+
+Cooldowns are keyed to the failed credential without storing or logging the key itself. Entries that resolve the same provider alias share the cooldown, including sibling routes. Removing a key does not clear its cooldown, so reintroducing it before expiry does not immediately retry it.
+
+Streaming rotation is narrower: ZeroClaw may replace a rate-limited key only before the stream emits any event. It never replays a request with another credential after visible output; the normal streaming recovery boundary below remains authoritative.
 
 ## Local development with hosted alternative
 
@@ -143,7 +147,7 @@ zeroclaw doctor traces --contains "model_provider"
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
 2. **Give fallback profiles explicit ownership.** Keep each endpoint, credential, model, and capability override on the profile that serves it.
 3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use ZeroClaw fallback profiles when the runtime should own the order.
-4. **Do not rely on `reliability.api_keys`.** Use separately constructed profiles until [issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) is fixed.
+4. **Use `reliability.api_keys` only for outbound API-key authentication.** Use separate provider profiles for OAuth, setup-token, ambient, CLI-backed, or independently configured fallback credentials.
 5. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
 6. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
 7. **Inject secrets via env, not inline.** `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `api_key` at startup; see [Environment variables](../reference/env-vars.md).
