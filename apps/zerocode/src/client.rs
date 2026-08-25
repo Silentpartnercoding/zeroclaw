@@ -3064,6 +3064,7 @@ pub struct StatusResult {
     #[serde(default)]
     pub local_ipc_endpoint: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)] // Decoded for status-wire compatibility; not rendered by Zerocode yet.
     pub shell_profile: Option<ShellProfileStatus>,
 }
 
