@@ -596,13 +596,12 @@ impl InFlightTaskCompletion {
     }
 }
 
-fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
-    let raw = match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
-        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
-    };
-    sanitize_session_key(&raw)
+fn conversation_memory_key(history_key: &str, message_id: &str) -> String {
+    // The runtime history key is the canonical conversation identity: it
+    // already includes the resolved channel alias, reply target, sender, and
+    // thread policy. Appending the transport message ID keeps each autosave
+    // row unique without rebuilding a competing identity from message fields.
+    sanitize_session_key(&format!("{history_key}_{message_id}"))
 }
 
 /// The channel prefix used in session/route keys: the channel type plus the
@@ -6303,7 +6302,7 @@ async fn process_channel_message_body(
         && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
-        let autosave_key = conversation_memory_key(&msg);
+        let autosave_key = conversation_memory_key(&history_key, &msg.id);
         let _ = ctx
             .memory
             .store(
@@ -14980,6 +14979,114 @@ temperature = 0.3
         );
         assert_eq!(multi_store.load(&alpha_key).len(), 1);
         assert_eq!(multi_store.load(&beta_key).len(), 1);
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    #[tokio::test]
+    async fn webhook_autosave_uses_canonical_history_identity_for_shared_agent_aliases() {
+        let (mut alpha_msg, alpha_channel) =
+            receive_webhook_test_message("alpha", "shared-sender").await;
+        let (mut beta_msg, beta_channel) =
+            receive_webhook_test_message("beta", "shared-sender").await;
+        alpha_msg.content = "trigger format error: alpha keeps this durable fact".to_string();
+        beta_msg.content = "trigger format error: beta keeps this different fact".to_string();
+        assert_eq!(alpha_msg.id, beta_msg.id, "listener counters must overlap");
+        assert_eq!(alpha_msg.reply_target, beta_msg.reply_target);
+
+        let registry = Arc::new(configured_channel_map(&[
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("alpha".to_string()),
+                channel: alpha_channel,
+            },
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("beta".to_string()),
+                channel: beta_channel,
+            },
+        ]));
+        assert!(!registry.contains_key("webhook"));
+
+        let memory_dir = TempDir::new().unwrap();
+        let memory = Arc::new(SqliteMemory::new("shared-agent", memory_dir.path()).unwrap());
+        let memory_for_ctx: Arc<dyn Memory> = memory.clone();
+        let shared_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::clone(&registry),
+            model_provider: Arc::new(FormatErrorModelProvider),
+            agent_alias: Arc::new("shared-agent".to_string()),
+            memory: memory_for_ctx,
+            auto_save_memory: true,
+            ack_reactions: false,
+            ..(*router_test_ctx()).clone()
+        });
+
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "shared-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["webhook.alpha".into(), "webhook.beta".into()],
+                ..Default::default()
+            },
+        );
+        let owners = build_owner_by_channel_key(
+            &config,
+            &["shared-agent".to_string()],
+            &["webhook.alpha".to_string(), "webhook.beta".to_string()],
+        );
+        let router = AgentRouter::multi(
+            HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
+            owners,
+            None,
+            None,
+        );
+        let resolved_alpha = router.resolve(&alpha_msg).expect("alpha owner");
+        let resolved_beta = router.resolve(&beta_msg).expect("beta owner");
+        assert!(Arc::ptr_eq(&resolved_alpha, &resolved_beta));
+
+        let alpha_history_key =
+            runtime_conversation_history_key(resolved_alpha.as_ref(), &alpha_msg);
+        let beta_history_key = runtime_conversation_history_key(resolved_beta.as_ref(), &beta_msg);
+        let alpha_autosave_key = conversation_memory_key(&alpha_history_key, &alpha_msg.id);
+        let beta_autosave_key = conversation_memory_key(&beta_history_key, &beta_msg.id);
+        assert_ne!(alpha_history_key, beta_history_key);
+        assert_ne!(alpha_autosave_key, beta_autosave_key);
+
+        process_channel_message(
+            Arc::clone(&resolved_alpha),
+            alpha_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            Arc::clone(&resolved_beta),
+            beta_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(memory.count().await.unwrap(), 2);
+        let alpha_entry = memory
+            .get(&alpha_autosave_key)
+            .await
+            .unwrap()
+            .expect("alpha autosave");
+        let beta_entry = memory
+            .get(&beta_autosave_key)
+            .await
+            .unwrap()
+            .expect("beta autosave");
+        assert_eq!(alpha_entry.content, alpha_msg.content);
+        assert_eq!(beta_entry.content, beta_msg.content);
+        assert_eq!(
+            alpha_entry.session_id.as_deref(),
+            Some(alpha_history_key.as_str())
+        );
+        assert_eq!(
+            beta_entry.session_id.as_deref(),
+            Some(beta_history_key.as_str())
+        );
     }
 
     #[test]
@@ -25281,7 +25388,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        let history_key = conversation_history_key(&msg);
+        assert_eq!(
+            conversation_memory_key(&history_key, &msg.id),
+            "slack_C456_U123_msg_abc123"
+        );
     }
 
     #[test]
@@ -26656,9 +26767,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
+        let history_key = conversation_history_key(&msg1);
+        assert_eq!(history_key, conversation_history_key(&msg2));
         assert_ne!(
-            conversation_memory_key(&msg1),
-            conversation_memory_key(&msg2)
+            conversation_memory_key(&history_key, &msg1.id),
+            conversation_memory_key(&history_key, &msg2.id)
         );
     }
 
@@ -26698,8 +26811,10 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
+        let msg1_history_key = conversation_history_key(&msg1);
+        let msg2_history_key = conversation_history_key(&msg2);
         mem.store(
-            &conversation_memory_key(&msg1),
+            &conversation_memory_key(&msg1_history_key, &msg1.id),
             &msg1.content,
             MemoryCategory::Conversation,
             None,
@@ -26707,7 +26822,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
         mem.store(
-            &conversation_memory_key(&msg2),
+            &conversation_memory_key(&msg2_history_key, &msg2.id),
             &msg2.content,
             MemoryCategory::Conversation,
             None,
@@ -26771,7 +26886,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let history_key = conversation_history_key(&msg);
 
         mem.store(
-            &conversation_memory_key(&msg),
+            &conversation_memory_key(&history_key, &msg.id),
             &msg.content,
             MemoryCategory::Conversation,
             Some(&history_key),
@@ -26828,7 +26943,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let group_b_history_key = conversation_history_key(&group_b_msg);
 
         mem.store(
-            &conversation_memory_key(&group_a_msg),
+            &conversation_memory_key(&group_a_history_key, &group_a_msg.id),
             &group_a_msg.content,
             MemoryCategory::Conversation,
             Some(&group_a_history_key),
