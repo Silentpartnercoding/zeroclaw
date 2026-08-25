@@ -1437,8 +1437,47 @@ mod tests {
             .await
     }
 
+    /// Panic-safe owner for one process-wide environment mutation. Requiring
+    /// the shared lock guard at construction keeps writers and every
+    /// environment-reading model probe in the same serialized test domain.
+    struct TestEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvVar {
+        fn set(
+            _env_lock: &tokio::sync::MutexGuard<'static, ()>,
+            key: &'static str,
+            value: &str,
+        ) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: all tests that read or mutate the model-routing
+            // environment hold `env_override_test_lock`; Drop restores the
+            // exact prior process value before that lock is released.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: this guard is declared after the shared lock guard, so
+            // Rust drops it first while the model-routing environment remains
+            // exclusively owned by this test.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1633,6 +1672,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1654,6 +1694,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1674,6 +1715,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_uses_saved_alias_config_not_stale_snapshot() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let stale_snapshot = test_config(&tmp).await;
         let tool = ModelRoutingConfigTool::new(stale_snapshot.clone(), test_security());
@@ -1712,6 +1754,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_does_not_swallow_provider_construction_errors() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let mut cfg = (*test_config(&tmp).await).clone();
         cfg.providers
@@ -1732,6 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_falls_back_to_runtime_snapshot_credential_when_saved_config_has_none() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let base = test_config(&tmp).await;
 
@@ -1768,6 +1812,7 @@ mod tests {
     /// failed validation while reporting `Reverted to '(none)'`.
     #[tokio::test]
     async fn set_default_fails_and_removes_a_newly_created_alias_on_construction_error() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
 
@@ -1857,6 +1902,7 @@ mod tests {
     /// restores the previous entry rather than removing it.
     #[tokio::test]
     async fn set_default_restores_the_previous_entry_on_construction_error() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1937,17 +1983,12 @@ mod tests {
         // construction failing is observable proof of which layer was read,
         // with no network request.
         let key_var = "ZEROCLAW_providers__models__openai__probe_env_case__api_key";
-        // SAFETY: this test owns this env-var key and removes it before the
-        // next phase. The value is synthetic, not a credential.
-        unsafe { std::env::set_var(key_var, "sk-ant-env-key") };
-
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
-        let probe = tool
-            .probe_model(&saved, &format!("openai.{ALIAS}"), Some("gpt-test"))
-            .await;
-
-        // SAFETY: undo the test-only process env mutation above.
-        unsafe { std::env::remove_var(key_var) };
+        let probe = {
+            let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
+            tool.probe_model(&saved, &format!("openai.{ALIAS}"), Some("gpt-test"))
+                .await
+        };
 
         let failure = probe.expect_err(
             "the env-overridden anthropic-shaped key must reach provider construction; the \
@@ -1967,19 +2008,11 @@ mod tests {
         // whole override layer is applied rather than the credential alone.
         // This phase is pure config resolution; nothing is dispatched.
         let uri_var = "ZEROCLAW_providers__models__openai__probe_env_case__uri";
-        // SAFETY: this test owns these env-var keys and removes them below.
-        unsafe {
-            std::env::set_var(key_var, "sk-ant-env-key");
-            std::env::set_var(uri_var, "https://env.invalid/v1");
-        }
-
-        let effective = ModelRoutingConfigTool::effective_config_for_probe(&saved);
-
-        // SAFETY: undo the test-only process env mutations above.
-        unsafe {
-            std::env::remove_var(key_var);
-            std::env::remove_var(uri_var);
-        }
+        let effective = {
+            let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
+            let _uri = TestEnvVar::set(&_env_guard, uri_var, "https://env.invalid/v1");
+            ModelRoutingConfigTool::effective_config_for_probe(&saved)
+        };
 
         let effective = effective.expect("effective config must build");
         let entry = effective
@@ -2052,17 +2085,12 @@ mod tests {
         }
 
         let model_var = "ZEROCLAW_providers__models__openai__probe_env_model_case__model";
-        // SAFETY: this test owns this env-var key and removes it below. The
-        // value is a synthetic model name, not a credential.
-        unsafe { std::env::set_var(model_var, "gpt-env") };
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env");
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
         let probe = tool
             .probe_model(&saved, &format!("openai.{ALIAS}"), Some("gpt-disk"))
             .await;
-
-        // SAFETY: undo the test-only process env mutation above.
-        unsafe { std::env::remove_var(model_var) };
 
         assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
@@ -2121,9 +2149,7 @@ mod tests {
         saved.save().await.unwrap();
 
         let model_var = "ZEROCLAW_providers__models__openai__probe_env_only_model_case__model";
-        // SAFETY: this test owns this env-var key and removes it immediately
-        // after the awaited tool call. The value is synthetic.
-        unsafe { std::env::set_var(model_var, "gpt-env-only") };
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-only");
 
         let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
         let result = tool
@@ -2134,10 +2160,6 @@ mod tests {
             }))
             .await
             .unwrap();
-
-        // SAFETY: undo the test-only process env mutation above before any
-        // assertion can panic.
-        unsafe { std::env::remove_var(model_var) };
 
         assert!(result.success, "the mock accepts the probe: {result:?}");
         let requests = server
@@ -2170,9 +2192,7 @@ mod tests {
         let saved = test_config(&tmp).await;
         let invalid_var =
             "ZEROCLAW_providers__models__openai__probe_env_error_case__not_a_schema_field";
-        // SAFETY: this test owns this env-var key and removes it immediately
-        // after the awaited probe. The value is synthetic.
-        unsafe { std::env::set_var(invalid_var, "invalid") };
+        let _invalid = TestEnvVar::set(&_env_guard, invalid_var, "invalid");
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&saved), test_security());
         let result = tool
@@ -2182,10 +2202,6 @@ mod tests {
                 Some("gpt-test"),
             )
             .await;
-
-        // SAFETY: undo the test-only process env mutation above before any
-        // assertion can panic.
-        unsafe { std::env::remove_var(invalid_var) };
 
         assert!(
             matches!(result, Err(ProbeFailure::Construction(_))),
