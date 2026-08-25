@@ -10018,7 +10018,7 @@ pub fn register_channels_for_tools(
 #[cfg(any(feature = "channel-telegram", feature = "voice-wake"))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
-    explicit_owner_by_channel_key(config, &enabled_agents)
+    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
         .get(channel_key)
         .and_then(|owner| config.agents.get(owner))
         .map(|agent| agent.transcription_provider.as_str().to_string())
@@ -29229,6 +29229,44 @@ This is an example JSON object for profile settings."#;
         assert_eq!(
             resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
             "groq.primary"
+        );
+    }
+
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn voice_wake_provider_uses_same_legacy_fallback_owner_as_router() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                transcription_provider: "local_whisper.office".into(),
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let collected_channel_keys = vec!["voice_wake.frontdoor".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("voice_wake.frontdoor").map(String::as_str),
+            Some("legacy"),
+            "AgentRouter must assign the enabled channel to the legacy fallback owner"
+        );
+        assert_eq!(
+            resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
+            "local_whisper.office",
+            "Voice Wake must select that same fallback owner's provider"
         );
     }
 
