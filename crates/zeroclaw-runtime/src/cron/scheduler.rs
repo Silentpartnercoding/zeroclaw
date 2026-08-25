@@ -2854,30 +2854,29 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn build_cron_shell_command_executes_with_custom_native_shell() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
         let shim = tmp.path().join("cron-shell-shim");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\nprintf 'CUSTOM_SHELL\\n'\nprintf 'arg:%s\\n' \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Avoid writing an executable after the test process is multithreaded:
+        // a concurrently forked child can inherit the write descriptor and
+        // make the subsequent exec fail with ETXTBSY.
+        let shell = which::which("sh").unwrap();
+        std::os::unix::fs::symlink(shell, &shim).unwrap();
 
         let mut config = Config::default();
         config.runtime.shell = Some(shim.to_string_lossy().into_owned());
-        let mut cmd =
-            build_configured_shell_command(&config, "echo cron-custom", tmp.path()).unwrap();
+        let mut cmd = build_configured_shell_command(
+            &config,
+            "printf 'CUSTOM_SHELL:%s\\n' \"$0\"",
+            tmp.path(),
+        )
+        .unwrap();
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success());
-        assert!(stdout.contains("CUSTOM_SHELL"), "{stdout}");
-        assert!(stdout.contains("arg:-c"), "{stdout}");
-        assert!(stdout.contains("arg:echo cron-custom"), "{stdout}");
+        assert_eq!(stdout.trim(), format!("CUSTOM_SHELL:{}", shim.display()));
     }
 
     #[test]
@@ -2923,7 +2922,15 @@ mod tests {
     fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
         let mut config = Config::default();
         config.runtime.shell = Some("powershell".into());
-        let security = SecurityPolicy::default();
+        // PowerShell-only command names are deliberately absent from the
+        // cross-dialect default allowlist (see
+        // `docs/book/src/security/sandboxing.md`): an operator opts into the
+        // cmdlets they need. Grant both documented spellings so the assertions
+        // below exercise the PowerShell grammar rather than the allowlist.
+        let security = SecurityPolicy {
+            allowed_commands: vec!["Write-Output".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
 
         crate::cron::validate_shell_command_with_security(
