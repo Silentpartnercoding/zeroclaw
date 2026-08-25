@@ -1941,6 +1941,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_jsonl_session_cannot_be_listed_or_resurrected_by_scoped_send() {
+        let tmp = TempDir::new().unwrap();
+        let session_key = format!(
+            "{}-owned",
+            (chrono::Local::now().date_naive() - chrono::Duration::days(10)).format("%Y-%m-%d")
+        );
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "jsonl").unwrap();
+        backend
+            .append(&session_key, &ChatMessage::user("retained private turn"))
+            .unwrap();
+        backend
+            .set_session_agent_alias(&session_key, "rowan")
+            .unwrap();
+
+        let mut hygiene = zeroclaw_config::schema::MemoryConfig::default();
+        hygiene.hygiene_enabled = true;
+        hygiene.archive_after_days = 7;
+        hygiene.purge_after_days = 0;
+        zeroclaw_memory::hygiene::run_if_due(&hygiene, tmp.path()).unwrap();
+
+        assert!(backend.list_sessions().is_empty());
+        let scope = SessionOwnershipScope::for_agent("rowan");
+        let listed =
+            SessionsListTool::for_agent(Arc::clone(&backend), test_security(), scope.clone())
+                .execute(json!({}))
+                .await
+                .unwrap();
+        assert!(listed.success);
+        assert!(listed.output.contains("No active sessions"));
+
+        let sent = SessionsSendTool::for_agent(Arc::clone(&backend), test_security(), scope)
+            .execute(json!({
+                "session_id": session_key,
+                "message": "must not resurrect"
+            }))
+            .await
+            .unwrap();
+        assert!(!sent.success);
+        assert!(
+            sent.error
+                .as_deref()
+                .is_some_and(|error| error.contains("not found"))
+        );
+        assert!(backend.list_sessions().is_empty());
+        assert!(
+            !tmp.path()
+                .join("sessions")
+                .join(format!("{session_key}.jsonl"))
+                .exists()
+        );
+        assert!(
+            !tmp.path()
+                .join("sessions")
+                .join(format!("{session_key}.metadata.json"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn send_scoped_denies_other_agent_session() {
         let (_tmp, backend) = seeded_metadata_backend(vec![session_metadata(
             "telegram__alice",

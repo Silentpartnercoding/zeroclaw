@@ -11,15 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_api::session_keys::{
+    JSONL_SESSION_FILE_SUFFIX as SESSION_FILE_SUFFIX,
+    JSONL_SESSION_METADATA_FILE_SUFFIX as METADATA_FILE_SUFFIX,
+    JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX,
+};
 
 #[derive(Default)]
 pub(crate) struct MutationState {
     migrated: bool,
     receipt_state_uncertain: bool,
 }
-
-const SESSION_FILE_SUFFIX: &str = ".jsonl";
-const METADATA_FILE_SUFFIX: &str = ".metadata.json";
 
 /// Durable facts that cannot be recovered from the append-only message file.
 /// Message count and timestamps remain derived from the session files at read
@@ -65,7 +67,12 @@ pub(crate) fn mark_metadata_sidecar_migrated(
     if !path.exists() {
         return Ok(());
     }
-    std::fs::rename(&path, path.with_extension("json.migrated"))
+    let migrated = sessions_dir.join(format!(
+        "{}{}",
+        sanitize_session_key(session_key),
+        JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX
+    ));
+    std::fs::rename(&path, migrated)
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;

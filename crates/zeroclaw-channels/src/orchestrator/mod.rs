@@ -5969,6 +5969,15 @@ fn stamp_session_routing_context(
         room_id,
         sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
     };
+    if let Err(e) = store.set_session_agent_alias(history_key, ctx.agent_alias.as_str()) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"history_key": history_key, "e": e.to_string()})),
+            "Failed to stamp session agent ownership"
+        );
+    }
     if let Err(e) = store.set_session_context(history_key, context) {
         ::zeroclaw_log::record!(
             WARN,
@@ -14747,10 +14756,75 @@ temperature = 0.3
             let metadata = session_store
                 .get_session_metadata(case.history_key)
                 .unwrap();
+            assert_eq!(metadata.agent_alias.as_deref(), Some("test-agent"));
             assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
             assert_eq!(metadata.room_id.as_deref(), case.expected_room);
             assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
         }
+    }
+
+    #[tokio::test]
+    async fn aliasless_channel_session_remains_available_to_owning_agent_tools() {
+        use zeroclaw_tools::sessions::{
+            SessionOwnershipScope, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        session_store
+            .append(
+                "webhook-session",
+                &ChatMessage::user("private webhook turn"),
+            )
+            .unwrap();
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            ..(*router_test_ctx()).clone()
+        };
+        let msg = ChannelMessage {
+            id: "webhook-msg".into(),
+            sender: "webhook-user".into(),
+            reply_target: "webhook-target".into(),
+            content: "private webhook turn".into(),
+            channel: "webhook".into(),
+            channel_alias: None,
+            ..Default::default()
+        };
+        stamp_session_routing_context(&ctx, &msg, "webhook-session");
+
+        let scope = SessionOwnershipScope::for_agent("test-agent");
+        let security = Arc::new(SecurityPolicy::default());
+        let listed = SessionsListTool::for_agent(
+            Arc::clone(&session_store),
+            Arc::clone(&security),
+            scope.clone(),
+        )
+        .execute(serde_json::json!({}))
+        .await
+        .unwrap();
+        assert!(listed.success);
+        assert!(listed.output.contains("webhook-session"));
+
+        let history = SessionsHistoryTool::for_agent(
+            Arc::clone(&session_store),
+            Arc::clone(&security),
+            scope.clone(),
+        )
+        .execute(serde_json::json!({"session_id": "webhook-session"}))
+        .await
+        .unwrap();
+        assert!(history.success);
+        assert!(history.output.contains("private webhook turn"));
+
+        let sent = SessionsSendTool::for_agent(session_store, security, scope)
+            .execute(serde_json::json!({
+                "session_id": "webhook-session",
+                "message": "owned follow-up"
+            }))
+            .await
+            .unwrap();
+        assert!(sent.success);
     }
 
     #[tokio::test]
