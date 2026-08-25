@@ -25,7 +25,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_api::runtime_status::RuntimeConfigKind;
+use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
@@ -41,6 +41,7 @@ struct StatusRuntimeContext {
     config_file: String,
     config_kind: RuntimeConfigKind,
     local_ipc_endpoint: String,
+    shell_profile: Option<RuntimeShellProfile>,
 }
 
 fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
@@ -51,12 +52,17 @@ fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> St
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+    let shell_profile = zeroclaw_config::platform::create_runtime(&config.runtime)
+        .ok()
+        .and_then(|runtime| runtime.shell_profile())
+        .and_then(RuntimeShellProfile::from_runtime_profile);
 
     StatusRuntimeContext {
         config_dir,
         config_file,
         config_kind,
         local_ipc_endpoint,
+        shell_profile,
     }
 }
 
@@ -1018,6 +1024,7 @@ impl RpcDispatcher {
             config_file: Some(runtime_context.config_file),
             config_kind: Some(runtime_context.config_kind),
             local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
+            shell_profile: runtime_context.shell_profile,
         })
     }
 
@@ -4922,9 +4929,32 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use zeroclaw_api::runtime_status::RuntimeShellFamily;
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    fn expected_default_shell_family() -> RuntimeShellFamily {
+        #[cfg(target_os = "windows")]
+        {
+            RuntimeShellFamily::Cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            RuntimeShellFamily::Posix
+        }
+    }
+
+    fn expected_default_shell_name() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "cmd"
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sh"
+        }
     }
 
     #[test]
@@ -6996,6 +7026,17 @@ mod tests {
                 .display()
                 .to_string()
         );
+        assert_eq!(
+            context.shell_profile.as_ref().map(|profile| profile.family),
+            Some(expected_default_shell_family())
+        );
+        assert_eq!(
+            context
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.name.as_str()),
+            Some(expected_default_shell_name())
+        );
 
         config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
         assert_eq!(
@@ -7029,6 +7070,17 @@ mod tests {
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+        assert_eq!(
+            status.shell_profile.as_ref().map(|profile| profile.family),
+            Some(expected_default_shell_family())
+        );
+        assert_eq!(
+            status
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.name.as_str()),
+            Some(expected_default_shell_name())
         );
     }
 

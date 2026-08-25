@@ -3063,6 +3063,15 @@ pub struct StatusResult {
     pub config_kind: Option<String>,
     #[serde(default)]
     pub local_ipc_endpoint: Option<String>,
+    #[serde(default)]
+    pub shell_profile: Option<ShellProfileStatus>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ShellProfileStatus {
+    pub name: String,
+    pub family: String,
 }
 
 #[cfg(test)]
@@ -3078,7 +3087,11 @@ mod dashboard_status_tests {
             "config_dir": "/tmp/zeroclaw-profile",
             "config_file": "/tmp/zeroclaw-profile/config.toml",
             "config_kind": "temporary",
-            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock",
+            "shell_profile": {
+                "name": "pwsh",
+                "family": "powershell"
+            }
         });
 
         let status: StatusResult = serde_json::from_value(value).unwrap();
@@ -3092,6 +3105,20 @@ mod dashboard_status_tests {
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some("/tmp/zeroclaw-profile/data/daemon.sock")
+        );
+        assert_eq!(
+            status
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.name.as_str()),
+            Some("pwsh")
+        );
+        assert_eq!(
+            status
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.family.as_str()),
+            Some("powershell")
         );
     }
 
@@ -3110,6 +3137,7 @@ mod dashboard_status_tests {
         assert_eq!(status.config_file, None);
         assert_eq!(status.config_kind, None);
         assert_eq!(status.local_ipc_endpoint, None);
+        assert_eq!(status.shell_profile, None);
     }
 }
 
