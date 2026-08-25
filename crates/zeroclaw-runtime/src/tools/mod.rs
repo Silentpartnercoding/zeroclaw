@@ -160,7 +160,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
+use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
@@ -584,11 +584,34 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
-/// Assemble the shell tool with the sandbox selected for the configured
-/// runtime. This is the single seam that pairs `root_config.runtime.kind`
-/// with the risk profile's sandbox selection; `all_tools_with_runtime` and
-/// integration tests both go through it so a wrong runtime-kind wiring here
-/// cannot pass unnoticed.
+struct RuntimeShellAssembly {
+    shell_tool: ShellTool,
+    sandbox: Arc<dyn Sandbox>,
+}
+
+/// Pair the canonical runtime kind with one shared sandbox instance for every
+/// runtime-backed executor assembled by the production tool registry.
+fn runtime_shell_assembly(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> RuntimeShellAssembly {
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+    );
+    let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
+    RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    }
+}
+
+/// Assemble a shell tool through the same runtime/sandbox ownership seam used
+/// by the production registry.
 #[must_use]
 pub fn shell_tool_for_runtime(
     security: Arc<SecurityPolicy>,
@@ -596,13 +619,7 @@ pub fn shell_tool_for_runtime(
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
     root_config: &Config,
 ) -> ShellTool {
-    let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(
-        &sandbox_cfg,
-        root_config.runtime.kind,
-        Some(&security.workspace_dir),
-    );
-    ShellTool::new_with_sandbox(security, runtime, sandbox)
+    runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -693,14 +710,10 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
-    let sandbox_cfg = risk_profile.sandbox_config();
-    // `create_sandbox` is runtime-kind aware: under the Docker runtime it returns
-    // the noop sandbox so the runtime owns the only container layer.
-    let sandbox = create_sandbox(
-        &sandbox_cfg,
-        root_config.runtime.kind,
-        Some(&security.workspace_dir),
-    );
+    let RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -712,7 +725,7 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
+            shell_tool
                 .with_timeout_secs(if security.shell_timeout_secs > 0 {
                     security.shell_timeout_secs
                 } else {

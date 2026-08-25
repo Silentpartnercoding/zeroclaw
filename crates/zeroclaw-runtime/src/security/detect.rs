@@ -6,8 +6,6 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
-const DOCKER_RUNTIME_DESCRIPTION: &str =
-    "Docker runtime container isolation (runtime.kind = \"docker\"; no additional sandbox wrapper)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
 const FIREJAIL_DESCRIPTION: &str = "Linux user-space sandbox (requires firejail to be installed)";
 const BUBBLEWRAP_DESCRIPTION: &str = "User namespace sandbox (requires bwrap)";
@@ -19,7 +17,7 @@ const SEATBELT_DESCRIPTION: &str = "macOS Seatbelt sandbox (built-in sandbox-exe
 pub struct SandboxPosture {
     pub requested_backend: &'static str,
     pub active_backend: &'static str,
-    pub active_description: &'static str,
+    pub active_description: String,
     pub fallback: bool,
 }
 
@@ -32,7 +30,8 @@ pub fn sandbox_posture(
 ) -> SandboxPosture {
     let requested_backend = sandbox_backend_name(&sandbox.backend);
     if matches!(sandbox.backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
-        return sandbox_posture_result(requested_backend, "none", NOOP_DESCRIPTION);
+        let active = runtime_fallback_backend(runtime_kind);
+        return sandbox_posture_result(requested_backend, active.name(), active.description());
     }
 
     let active_backend =
@@ -48,7 +47,7 @@ pub fn sandbox_posture(
 fn sandbox_posture_result(
     requested_backend: &'static str,
     active_backend: &'static str,
-    active_description: &'static str,
+    active_description: String,
 ) -> SandboxPosture {
     SandboxPosture {
         requested_backend,
@@ -90,15 +89,17 @@ impl SelectedSandboxBackend {
         }
     }
 
-    fn description(self) -> &'static str {
+    fn description(self) -> String {
         match self {
-            Self::None => NOOP_DESCRIPTION,
-            Self::Landlock => LANDLOCK_DESCRIPTION,
-            Self::Firejail => FIREJAIL_DESCRIPTION,
-            Self::Bubblewrap => BUBBLEWRAP_DESCRIPTION,
-            Self::Docker => DOCKER_DESCRIPTION,
-            Self::DockerRuntime => DOCKER_RUNTIME_DESCRIPTION,
-            Self::SandboxExec => SEATBELT_DESCRIPTION,
+            Self::None => NOOP_DESCRIPTION.to_string(),
+            Self::Landlock => LANDLOCK_DESCRIPTION.to_string(),
+            Self::Firejail => FIREJAIL_DESCRIPTION.to_string(),
+            Self::Bubblewrap => BUBBLEWRAP_DESCRIPTION.to_string(),
+            Self::Docker => DOCKER_DESCRIPTION.to_string(),
+            Self::DockerRuntime => crate::i18n::get_required_cli_string(
+                "cli-security-status-sandbox-description-docker-runtime",
+            ),
+            Self::SandboxExec => SEATBELT_DESCRIPTION.to_string(),
         }
     }
 
@@ -119,8 +120,18 @@ fn configured_backend_selection(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
 ) -> SelectedSandboxBackend {
+    configured_backend_selection_with(backend, runtime_kind, |selected| {
+        sandbox_backend_available(selected, workspace_dir)
+    })
+}
+
+fn configured_backend_selection_with(
+    backend: &SandboxBackend,
+    runtime_kind: RuntimeKind,
+    mut is_available: impl FnMut(SelectedSandboxBackend) -> bool,
+) -> SelectedSandboxBackend {
     if matches!(backend, SandboxBackend::Auto) {
-        return detect_best_backend(runtime_kind, workspace_dir);
+        return detect_best_backend_with(runtime_kind, is_available);
     }
 
     if matches!(backend, SandboxBackend::Docker) && matches!(runtime_kind, RuntimeKind::Docker) {
@@ -129,8 +140,16 @@ fn configured_backend_selection(
 
     SelectedSandboxBackend::from_config(backend)
         .filter(|selected| sandbox_backend_compatible_with_runtime(*selected, runtime_kind))
-        .filter(|selected| sandbox_backend_available(*selected, workspace_dir))
-        .unwrap_or(SelectedSandboxBackend::None)
+        .filter(|selected| is_available(*selected))
+        .unwrap_or_else(|| runtime_fallback_backend(runtime_kind))
+}
+
+fn runtime_fallback_backend(runtime_kind: RuntimeKind) -> SelectedSandboxBackend {
+    if matches!(runtime_kind, RuntimeKind::Docker) {
+        SelectedSandboxBackend::DockerRuntime
+    } else {
+        SelectedSandboxBackend::None
+    }
 }
 
 fn sandbox_backend_compatible_with_runtime(
@@ -197,11 +216,7 @@ fn detect_best_backend_with(
         return SelectedSandboxBackend::Docker;
     }
 
-    if matches!(runtime_kind, RuntimeKind::Docker) {
-        return SelectedSandboxBackend::DockerRuntime;
-    }
-
-    SelectedSandboxBackend::None
+    runtime_fallback_backend(runtime_kind)
 }
 
 fn sandbox_backend_available(
@@ -307,7 +322,13 @@ pub fn create_sandbox(
         requested => {
             let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
             if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
-                log_docker_sandbox_redundant_with_docker_runtime();
+                if matches!(requested, SandboxBackend::Docker) {
+                    log_docker_sandbox_redundant_with_docker_runtime();
+                } else {
+                    log_requested_backend_unavailable_with_docker_runtime(selected_backend_label(
+                        requested,
+                    ));
+                }
                 return Arc::new(super::traits::NoopSandbox);
             }
             if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
@@ -435,6 +456,17 @@ fn log_requested_backend_unavailable(label: &'static str) {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
         &format!("{label} requested but not available, falling back to application-layer")
+    );
+}
+
+fn log_requested_backend_unavailable_with_docker_runtime(label: &'static str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        &format!(
+            "{label} requested but not available; Docker runtime container isolation remains active"
+        )
     );
 }
 
@@ -712,11 +744,61 @@ mod tests {
 
         assert_eq!(posture.requested_backend, "docker");
         assert_eq!(posture.active_backend, "docker-runtime");
-        assert_eq!(posture.active_description, DOCKER_RUNTIME_DESCRIPTION);
+        assert_eq!(
+            posture.active_description,
+            crate::i18n::get_required_cli_string(
+                "cli-security-status-sandbox-description-docker-runtime"
+            )
+        );
         assert!(
             !posture.fallback,
             "Docker runtime honors the requested containment; it is not a fallback"
         );
+    }
+
+    #[test]
+    fn disabled_optional_sandbox_still_reports_docker_runtime_containment() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        };
+
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Docker, None);
+
+        assert_eq!(posture.requested_backend, "auto");
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn absent_optional_sandbox_still_reports_docker_runtime_containment() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
+        };
+
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Docker, None);
+
+        assert_eq!(posture.requested_backend, "none");
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(!posture.fallback);
+    }
+
+    #[test]
+    fn unavailable_explicit_backend_falls_back_to_docker_runtime_containment() {
+        let selected = configured_backend_selection_with(
+            &SandboxBackend::SandboxExec,
+            RuntimeKind::Docker,
+            |_| false,
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+        let posture =
+            sandbox_posture_result("sandbox-exec", selected.name(), selected.description());
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert!(posture.fallback);
     }
 
     #[test]
