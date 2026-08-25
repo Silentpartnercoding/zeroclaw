@@ -2815,6 +2815,7 @@ impl Agent {
                     error,
                     committed_response: String::new(),
                     new_messages: new_msgs,
+                    terminal_reason: None,
                 });
             }
         };

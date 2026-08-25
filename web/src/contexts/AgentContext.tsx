@@ -24,6 +24,7 @@ import {
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
+  mergeServerHistoryWithLocalNotices,
   persistedToUiMessages,
   saveChatHistory,
   uiMessagesToPersisted,
@@ -177,7 +178,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         if (cancelled) return;
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
-            setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+            const server = mapServerMessagesToPersisted(res.messages);
+            const local = loadChatHistory(sid);
+            setMessages(
+              persistedToUiMessages(mergeServerHistoryWithLocalNotices(server, local)),
+            );
           }
         } else if (!res.session_persistence) {
           setMessages((prev) => {

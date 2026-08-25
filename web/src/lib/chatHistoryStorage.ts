@@ -1,5 +1,5 @@
-import type { SessionMessageRow } from '@/types/api';
-import { generateUUID } from '@/lib/uuid';
+import type { SessionMessageRow } from '../types/api.ts';
+import { generateUUID } from './uuid.ts';
 
 const MAX_MESSAGES = 100;
 const PREFIX = 'zeroclaw_chat_history_v1:';
@@ -10,6 +10,8 @@ export interface PersistedChatBubble {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  /** Trusted lifecycle marker retained for a locally durable terminal notice. */
+  notice?: boolean;
   /** Verbatim locally-composed user input — never gateway-prefixed, so the
    *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
   local?: boolean;
@@ -87,6 +89,7 @@ export function persistedToUiMessages(
   content: string;
   thinking?: string;
   markdown?: boolean;
+  notice?: boolean;
   local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
@@ -97,6 +100,7 @@ export function persistedToUiMessages(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    notice: m.notice,
     local: m.local,
     toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
@@ -110,6 +114,7 @@ export function uiMessagesToPersisted(
     content: string;
     thinking?: string;
     markdown?: boolean;
+    notice?: boolean;
     local?: boolean;
     ephemeral?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
@@ -127,10 +132,45 @@ export function uiMessagesToPersisted(
       content: m.content,
       thinking: m.thinking,
       markdown: m.markdown,
+      notice: m.notice,
       // Preserve the verbatim-user-input flag so reloaded bubbles still skip
       // server-timestamp stripping.
       local: m.local,
       toolCall: m.toolCall,
       timestamp: m.timestamp.toISOString(),
     }));
+}
+
+/**
+ * Merge only explicitly retained lifecycle notices into an otherwise
+ * authoritative server transcript. A `persisted: false` WebSocket frame marks
+ * its notice as locally durable; server hydration must not erase it merely
+ * because a session backend exists but missed that message.
+ *
+ * Matching uses a multiset so repeated context-exhaustion turns remain
+ * distinct while a notice already present on the server is not duplicated.
+ */
+export function mergeServerHistoryWithLocalNotices(
+  server: PersistedChatBubble[],
+  local: PersistedChatBubble[],
+): PersistedChatBubble[] {
+  const serverNoticeCounts = new Map<string, number>();
+  for (const message of server) {
+    const key = `${message.role}\0${message.content}`;
+    serverNoticeCounts.set(key, (serverNoticeCounts.get(key) ?? 0) + 1);
+  }
+
+  const retained: PersistedChatBubble[] = [];
+  for (const message of local) {
+    if (message.notice !== true) continue;
+    const key = `${message.role}\0${message.content}`;
+    const serverCount = serverNoticeCounts.get(key) ?? 0;
+    if (serverCount > 0) {
+      serverNoticeCounts.set(key, serverCount - 1);
+    } else {
+      retained.push(message);
+    }
+  }
+
+  return retained.length === 0 ? server : [...server, ...retained];
 }
