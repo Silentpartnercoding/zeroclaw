@@ -757,7 +757,7 @@ impl RpcDispatcher {
             Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
-            Method::SessionNew => self.handle_session_new(&req.params).await,
+            Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
             Method::SessionClose => self.handle_session_close(&req.params).await,
             Method::SessionPrompt => {
                 // Always spawn — turn completion is signaled by a
@@ -7258,6 +7258,24 @@ mod tests {
         (dispatcher, sessions)
     }
 
+    fn make_acp_test_dispatcher_with_receiver(
+        config: zeroclaw_config::schema::Config,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, sessions, rx)
+    }
+
     /// Create a Chat-mode session through the real `session/new` handler,
     /// optionally sending the `keep_siblings` opt-out.
     async fn new_chat_session_for_eviction_test(
@@ -10790,6 +10808,45 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
         dispatcher.authenticated = true;
         (dispatcher, rx)
+    }
+
+    #[test]
+    fn process_line_session_new_creates_session_on_two_megabyte_stack() {
+        std::thread::Builder::new()
+            .name("rpc-session-new-stack-regression".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let tmp = tempfile::TempDir::new().expect("temporary test directory");
+                    let config = make_acp_test_config(&tmp);
+                    let (mut dispatcher, sessions, mut rx) =
+                        make_acp_test_dispatcher_with_receiver(config);
+                    let session_id = "rpc-stack-regression";
+                    let line = format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"agent_alias":"test-agent","chat_mode":"chat","session_id":"{session_id}"}}}}"#
+                    );
+
+                    dispatcher.process_line(&line).await;
+
+                    let response = rx.recv().await.expect("session/new response");
+                    let response: Value =
+                        serde_json::from_str(&response).expect("response should be valid JSON");
+                    assert_eq!(response["id"], json!(1));
+                    assert_eq!(response["result"]["session_id"], json!(session_id));
+                    assert_eq!(response["result"]["agent_alias"], json!("test-agent"));
+                    assert!(
+                        sessions.get_agent(session_id).await.is_some(),
+                        "session/new response must correspond to a registered session"
+                    );
+                });
+            })
+            .expect("stack regression thread should spawn")
+            .join()
+            .expect("session/new should not exhaust a two-megabyte stack");
     }
 
     #[tokio::test]
